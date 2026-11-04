@@ -34,6 +34,13 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     end
   end
 
+  # Not a job, whatever it says about itself
+  class NotAJob
+    def self.rate_limited?
+      true
+    end
+  end
+
   def self.const_missing(name)
     name == :BrokenJob ? raise(SyntaxError, "broken") : super
   end
@@ -158,7 +165,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
   end
 
   test "a job whose class is missing, raises when it loads or isn't a job is claimed and fails as without the gem" do
-    jobs = [ "SolidQueue::RateLimitClaimTest::MissingJob", "SolidQueue::RateLimitClaimTest::BrokenJob", "String" ].map do |class_name|
+    jobs = [ "SolidQueue::RateLimitClaimTest::MissingJob", "SolidQueue::RateLimitClaimTest::BrokenJob", "String", "SolidQueue::RateLimitClaimTest::NotAJob" ].map do |class_name|
       UnlimitedJob.perform_later(class_name).tap do |active_job|
         job = SolidQueue::Job.find(active_job.provider_job_id)
         job.update_columns(class_name: class_name, arguments: job.arguments.merge("job_class" => class_name))
