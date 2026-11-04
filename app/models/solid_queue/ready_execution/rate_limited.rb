@@ -64,7 +64,7 @@ module SolidQueue
           # A class that can't be loaded fails its jobs when they run, as without the gem
           def rate_limited_job_class(class_name)
             job_class = class_name.constantize
-            job_class if job_class.is_a?(Class) && job_class < ActiveJob::Base && job_class.rate_limited?
+            job_class if job_class.try(:rate_limited?)
           rescue StandardError, ScriptError
             nil
           end

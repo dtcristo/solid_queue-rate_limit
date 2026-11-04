@@ -19,6 +19,10 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     end
   end
 
+  def self.const_missing(name)
+    name == :BrokenJob ? raise(SyntaxError, "broken") : super
+  end
+
   setup do
     travel_to Time.utc(2026, 1, 1, 12)
     @process = SolidQueue::Process.register(kind: "Worker", pid: 42, name: "rate-limit-test-worker")
@@ -92,6 +96,58 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     assert_equal 0, claim(10).size
 
     travel 10.seconds
+    LimitedJob.perform_later(3)
+    assert_equal 1, claim(10).size
+  end
+
+  test "a job that still has a concurrency key is admitted without a rate check" do
+    jobs = 3.times.map { |i| LimitedJob.perform_later(i) }
+    SolidQueue::Job.update_all(concurrency_key: "switched from limits_concurrency")
+
+    assert_equal provider_ids(jobs), claim(10).map(&:job_id)
+    assert_equal 0, SolidQueue::ScheduledExecution.count
+  end
+
+  test "a class that dropped its limit has its jobs claimed, deferred ones included" do
+    3.times { |i| LimitedJob.perform_later(i) }
+    claim(10)
+
+    LimitedJob.with(rate_limit_to: nil) do
+      2.times { |i| LimitedJob.perform_later(i) }
+      assert_equal 2, claim(10).size
+
+      SolidQueue::ScheduledExecution.update_all(scheduled_at: Time.current)
+      SolidQueue::ScheduledExecution.dispatch_next_batch(10)
+      assert_equal 1, claim(10).size
+    end
+  end
+
+  test "a job whose class is missing, raises when it loads or isn't a job is claimed and fails as without the gem" do
+    jobs = [ "SolidQueue::RateLimitClaimTest::MissingJob", "SolidQueue::RateLimitClaimTest::BrokenJob", "String" ].map do |class_name|
+      UnlimitedJob.perform_later(class_name).tap do |active_job|
+        job = SolidQueue::Job.find(active_job.provider_job_id)
+        job.update_columns(class_name: class_name, arguments: job.arguments.merge("job_class" => class_name))
+      end
+    end
+
+    claim(10).each { |execution| assert_raises(StandardError, ScriptError) { execution.perform } }
+
+    assert_equal provider_ids(jobs), SolidQueue::FailedExecution.order(:job_id).pluck(:job_id)
+  end
+
+  test "workers with different settings share one budget, each applying its own" do
+    2.times { |i| LimitedJob.perform_later(i) }
+    assert_equal 2, claim(10).size
+
+    # A deploy that loosens the limit: the old debt is clamped to the new burst
+    LimitedJob.with(rate_limit_to: 10, rate_limit_burst: 10) do
+      LimitedJob.perform_later(2)
+      assert_equal 0, claim(10).size
+      assert_equal Time.current + 1.second, SolidQueue::ScheduledExecution.sole.scheduled_at
+    end
+
+    # A worker still on the old limit allows more of the budget at once
+    travel 1.second
     LimitedJob.perform_later(3)
     assert_equal 1, claim(10).size
   end
