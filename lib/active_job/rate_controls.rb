@@ -60,7 +60,7 @@ module ActiveJob
 
         ensure_rate_limit_compatible_with_concurrency_controls(rate_limited: true)
 
-        @rate_limit_declared = true
+        @rate_limit_declared = SolidQueue::RateLimit.declared = true
         self.rate_limit_to = to
         self.rate_limit_per = per
         self.rate_limit_burst = burst

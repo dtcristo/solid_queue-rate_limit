@@ -24,6 +24,20 @@ module SolidQueue
       def migrated?
         @migrated ||= table_exists?
       end
+
+      # Returns the state of each key, by key, locked until the claim commits. A new
+      # key starts with a full budget. They're inserted and locked in key order, so
+      # claims that share keys can't deadlock on them.
+      def lock_all(keys, now)
+        keys = keys.sort
+
+        # On PostgreSQL even a skipped insert takes a value from the id sequence
+        if (missing = keys - where(key: keys).pluck(:key)).any?
+          insert_all(missing.map { |key| { key: key, tat: now } })
+        end
+
+        where(key: keys).order(:key).lock.index_by(&:key)
+      end
     end
 
     # Charges one admission and returns true, or returns false if the budget is spent.
