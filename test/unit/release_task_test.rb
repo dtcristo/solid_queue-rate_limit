@@ -90,6 +90,19 @@ class ReleaseTaskTest < ActiveSupport::TestCase
     assert_equal "Older summary.\n\n## Fixed\n\n- An old bug.", notes("v0.0.1")
   end
 
+  test "the last version's notes run to the end of a changelog without links" do
+    File.write(File.join(@repo, "CHANGELOG.md"), changelog.sub(/\n\[Unreleased\]:.*\z/m, ""))
+    git("commit", "--quiet", "--all", "--message", "Drop the links")
+    git("push", "--quiet", "origin", "main")
+    git("tag", "--annotate", "--message", "v0.0.1", "v0.0.1")
+    git("push", "--quiet", "origin", "refs/tags/v0.0.1")
+
+    output, status = run_release("0.0.1\n")
+
+    assert status.success?, output
+    assert_equal "Older summary.\n\n## Fixed\n\n- An old bug.", notes("v0.0.1")
+  end
+
   test "picks up where a failed run stopped" do
     git("tag", "--annotate", "--message", TAG, TAG)
     git("push", "--quiet", "origin", "refs/tags/#{TAG}")
