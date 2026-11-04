@@ -4,6 +4,7 @@
 - Don't add too much complexity.
 - Optimise the implementation for correctness, simple implementation and performance, all three of them, while still in the style of Solid Queue.
 - When there are multiple ways to implement something, implement it the way Solid Queue does.
+- Where something has a counterpart in Solid Queue or [solid_queue-coalesce](https://github.com/dtcristo/solid_queue-coalesce), make it work identically, such as how keys are built, column collations, and entry names in a job's serialized data. When the two differ, follow Solid Queue.
 - APIs should look very Rails-like.
 - Never alter Solid Queue's existing tables. Only add new ones.
 - Add user-visible changes to the top section of `CHANGELOG.md` in the same PR. Only record what's on `main`, not what an open issue proposes.
@@ -12,4 +13,3 @@
 - Update the Compatibility section of the README when the gemspec or CI matrix changes.
 - When a README recipe or the burst rule changes, update its test in the same PR. It's in `test/models/solid_queue/rate_limit_recipes_test.rb`. The tests define their own job classes, so they keep passing when they drift from the README.
 - While you work, run only scoped tests locally, such as `TARGET_DB=sqlite bin/rails test test/unit/engine_test.rb`. CI runs the full suite and the matrix.
-- While the repository is private, don't rely on CI. Before each merge, run the full suite locally on the latest stable Ruby and Rails, on SQLite, PostgreSQL and MySQL, with `BUNDLE_GEMFILE=gemfiles/rails_8_1.gemfile bundle exec rake test`. Remove this rule once the repository is public.
