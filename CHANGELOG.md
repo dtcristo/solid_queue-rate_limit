@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `key:` and `group:` for `limits_rate`, which take what `limits_concurrency` takes. `key:` gives each value a budget of its own, such as one for each account, and `group:` shares a budget between the classes that name it. The key is built like Solid Queue's concurrency key, worked out once when Solid Queue enqueues the job, and kept by its retries. Classes without either keep their 0.1.0 budget, and upgrading needs no migration. ([#19](https://github.com/dtcristo/solid_queue-rate_limit/pull/19))
 - `rate_limit_key` and `rate_limit_group` on job classes. ([#19](https://github.com/dtcristo/solid_queue-rate_limit/pull/19))
+- `SolidQueue::RateLimitState.clear_idle_in_batches(batch_size: 500, sleep_between_batches: 0)`, which deletes the state rows of budgets that are full and have no slots ahead, so per-key rows don't pile up. Clearing never changes what's admitted, and a claim that runs while it clears inserts the row again. The README has a `recurring.yml` entry to run it every hour.
 - `keys` in the `defer_rate_limited.solid_queue` payload and its log line, listing the budgets that deferred jobs. ([#19](https://github.com/dtcristo/solid_queue-rate_limit/pull/19))
 
 ### Changed
