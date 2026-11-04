@@ -42,6 +42,18 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     assert_equal 0, SolidQueue::ReadyExecution.count
   end
 
+  test "a deferral instruments defer_rate_limited for each class" do
+    jobs = 3.times.map { |i| LimitedJob.perform_later(i) }
+    events = []
+    subscriber = ActiveSupport::Notifications.subscribe("defer_rate_limited.solid_queue") { |event| events << event.payload }
+
+    claim(10)
+
+    assert_equal [ { class_name: LimitedJob.name, job_ids: [ jobs.last.provider_job_id ], size: 1 } ], events
+  ensure
+    ActiveSupport::Notifications.unsubscribe(subscriber)
+  end
+
   test "a deferred job keeps the scheduled_at it was enqueued with" do
     jobs = 3.times.map { |i| LimitedJob.perform_later(i) }
     enqueued_at = SolidQueue::Job.find(jobs.last.provider_job_id).scheduled_at

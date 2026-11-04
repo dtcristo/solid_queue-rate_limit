@@ -78,3 +78,12 @@ module SolidQueue
     end
   end
 end
+
+class SolidQueue::LogSubscriber
+  # A backlog can defer jobs on every claim, so above debug it shouldn't build a line for each
+  subscribe_log_level :defer_rate_limited, :debug
+
+  def defer_rate_limited(event) # :nodoc:
+    debug formatted_event(event, action: "Defer rate-limited jobs", **event.payload.slice(:class_name, :job_ids, :size))
+  end
+end
