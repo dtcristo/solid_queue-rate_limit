@@ -13,6 +13,9 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     end
   end
 
+  # Kept after a rename, for jobs enqueued under the old name
+  RenamedLimitedJob = LimitedJob
+
   class UnlimitedJob < ApplicationJob
     def perform(value)
       JobBuffer.add(value)
@@ -110,6 +113,14 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     travel 10.seconds
     LimitedJob.perform_later(3)
     assert_equal 1, claim(10).size
+  end
+
+  test "a job enqueued under an old name shares its class's budget" do
+    jobs = 3.times.map { |i| LimitedJob.perform_later(i) }
+    SolidQueue::Job.where(id: jobs.first.provider_job_id).update_all(class_name: "#{self.class.name}::RenamedLimitedJob")
+
+    assert_equal provider_ids(jobs.first(2)), claim(10).map(&:job_id)
+    assert_equal [ LimitedJob.name ], SolidQueue::RateLimitState.pluck(:key)
   end
 
   test "a job that still has a concurrency key is admitted without a rate check" do

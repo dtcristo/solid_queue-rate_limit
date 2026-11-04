@@ -11,10 +11,10 @@ module SolidQueue
         # the claim's transaction, after the candidates have been locked.
         def defer_rate_limited(executions)
           jobs = Job.where(id: executions.map(&:job_id)).select(:id, :class_name, :queue_name, :priority, :concurrency_key).index_by(&:id)
-          job_classes = jobs.values.map(&:class_name).uniq.filter_map { |class_name| rate_limited_job_class(class_name) }.index_by(&:name)
+          job_classes = jobs.values.map(&:class_name).uniq.index_with { |class_name| rate_limited_job_class(class_name) }.compact
 
           # A job with a concurrency key holds its semaphore, so it can't wait here
-          limited = executions.select { |execution| jobs[execution.job_id].concurrency_key.nil? && job_classes[jobs[execution.job_id].class_name] }
+          limited = executions.select { |execution| (job = jobs[execution.job_id]) && job.concurrency_key.nil? && job_classes[job.class_name] }
           return [] if limited.empty?
 
           next_checks = if RateLimitState.migrated?
@@ -32,8 +32,9 @@ module SolidQueue
           # Locks every limit the candidates need, in key order, then charges them in queue
           # order. Returns when each rejected candidate should look again. The time is
           # read once the locks are held, so claims that share a limit see it move on.
+          # A limit's key is its class's name, which a job enqueued under an alias shares.
           def check_rate_limits(executions, jobs, job_classes)
-            states = RateLimitState.lock_all(executions.map { |execution| jobs[execution.job_id].class_name }.uniq)
+            states = RateLimitState.lock_all(executions.map { |execution| job_classes[jobs[execution.job_id].class_name].name }.uniq)
             now = Time.current
 
             next_checks = executions.each_with_object({}) do |execution, deferred|
