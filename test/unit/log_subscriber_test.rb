@@ -16,10 +16,10 @@ class LogSubscriberTest < ActiveSupport::TestCase
 
   test "defer rate-limited jobs" do
     attach_log_subscriber
-    instrument "defer_rate_limited.solid_queue", class_name: "SyncStripeJob", job_ids: [ 1, 2 ], size: 2
+    instrument "defer_rate_limited.solid_queue", class_name: "SyncStripeJob", keys: [ "Stripe/1" ], job_ids: [ 1, 2 ], size: 2
 
     assert_equal 1, @logger.logged(:debug).size
-    assert_match(/SolidQueue-[\d.]+ Defer rate-limited jobs \(\d+\.\d+ms\)  class_name: "SyncStripeJob", job_ids: \[1, 2\], size: 2/, @logger.logged(:debug).last)
+    assert_match(%r{SolidQueue-[\d.]+ Defer rate-limited jobs \(\d+\.\d+ms\)  class_name: "SyncStripeJob", keys: \["Stripe/1"\], job_ids: \[1, 2\], size: 2}, @logger.logged(:debug).last)
   end
 
   test "a deferral line isn't built above debug" do

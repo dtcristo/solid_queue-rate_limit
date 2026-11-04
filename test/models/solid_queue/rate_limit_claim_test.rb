@@ -71,7 +71,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
 
     claim(10)
 
-    assert_equal [ { class_name: LimitedJob.name, job_ids: [ jobs.last.provider_job_id ], size: 1 } ], events
+    assert_equal [ { class_name: LimitedJob.name, keys: [ LimitedJob.name ], job_ids: [ jobs.last.provider_job_id ], size: 1 } ], events
   ensure
     ActiveSupport::Notifications.unsubscribe(subscriber)
   end
@@ -264,6 +264,15 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     queries = SolidQueue::RateLimit.with(declared: false) { capture_queries { claim(3) } }
 
     assert_equal [ "SolidQueue::Pause Pluck", "TRANSACTION", "SolidQueue::ReadyExecution Load", "SolidQueue::ClaimedExecution Insert", "SolidQueue::ClaimedExecution Load", "SolidQueue::ReadyExecution Delete All", "TRANSACTION" ], queries
+  end
+
+  test "a limited class without a key or a group claims with the same queries as 0.1.0" do
+    3.times { |i| LimitedJob.perform_later(i) }
+    SolidQueue::RateLimitState.create!(key: LimitedJob.name, tat: Time.current)
+
+    queries = capture_queries { claim(10) } - [ "SCHEMA" ]
+
+    assert_equal [ "SolidQueue::Pause Pluck", "TRANSACTION", "SolidQueue::ReadyExecution Load", "SolidQueue::Job Load", "SolidQueue::RateLimitState Pluck", "SolidQueue::RateLimitState Load", "SolidQueue::RateLimitState Update", "SolidQueue::ScheduledExecution Insert", "SolidQueue::ClaimedExecution Bulk Insert", "SolidQueue::ClaimedExecution Load", "SolidQueue::ReadyExecution Delete All", "SolidQueue::ReadyExecution Delete All", "TRANSACTION", "TRANSACTION", "SolidQueue::ReadyExecution Load", "TRANSACTION" ], queries
   end
 
   private

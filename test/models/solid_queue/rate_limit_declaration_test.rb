@@ -50,12 +50,21 @@ class SolidQueue::RateLimitDeclarationTest < ActiveSupport::TestCase
     assert_equal 1_000, job { limits_rate to: 1_000, per: 1.second }.rate_limit_to
   end
 
-  test "planned options raise with a link to the roadmap" do
-    [ { key: ->(account) { account } }, { group: "Stripe" }, { name: :account } ].each do |option|
-      error = assert_raises(ArgumentError) { job { limits_rate to: 1, per: 1.minute, **option } }
-      assert_match(/`#{option.keys.first}` isn't supported yet/, error.message)
-      assert_match(%r{https://github.com/dtcristo/solid_queue-rate_limit/issues/3}, error.message)
-    end
+  test "declares a key and a group, as limits_concurrency takes them" do
+    key = ->(account) { account }
+    job_class = job { limits_rate to: 1, per: 1.minute, key: key, group: "Stripe" }
+
+    assert_equal key, job_class.rate_limit_key
+    assert_equal "Stripe", job_class.rate_limit_group
+    assert_nil job { limits_rate to: 1, per: 1.minute }.rate_limit_key
+    assert_nil job { limits_rate to: 1, per: 1.minute }.rate_limit_group
+  end
+
+  test "name raises with a link to multiple limits" do
+    error = assert_raises(ArgumentError) { job { limits_rate to: 1, per: 1.minute, name: :account } }
+
+    assert_match(/`name` isn't supported yet/, error.message)
+    assert_match(%r{https://github.com/dtcristo/solid_queue-rate_limit/issues/14}, error.message)
   end
 
   test "unknown keywords raise" do
@@ -80,6 +89,13 @@ class SolidQueue::RateLimitDeclarationTest < ActiveSupport::TestCase
 
     assert child.rate_limited?
     assert_equal [ 5, 1.minute, 2 ], [ child.rate_limit_to, child.rate_limit_per, child.rate_limit_burst ]
+  end
+
+  test "a subclass inherits the key and the group, and redeclaring the limit drops them" do
+    parent = job { limits_rate to: 5, per: 1.minute, key: :account, group: "Stripe" }
+
+    assert_equal [ :account, "Stripe" ], [ Class.new(parent).rate_limit_key, Class.new(parent).rate_limit_group ]
+    assert_equal [ nil, nil ], Class.new(parent) { limits_rate to: 5, per: 1.minute }.then { |child| [ child.rate_limit_key, child.rate_limit_group ] }
   end
 
   test "a subclass can redeclare the limit without changing its parent's" do

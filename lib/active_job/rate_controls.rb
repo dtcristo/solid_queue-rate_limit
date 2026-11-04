@@ -7,10 +7,15 @@ module ActiveJob
 
     MIN_RATE_LIMIT_INTERVAL = 0.001
 
+    # Stored in the job's serialized Active Job data, which Active Job ignores when running the job
+    RATE_LIMIT_KEY = "solid_queue_rate_limit_key"
+
     included do
       class_attribute :rate_limit_to, instance_accessor: false
       class_attribute :rate_limit_per, instance_accessor: false
       class_attribute :rate_limit_burst, instance_accessor: false
+      class_attribute :rate_limit_key, instance_accessor: false
+      class_attribute :rate_limit_group, instance_accessor: false
     end
 
     module ClassMethods
@@ -28,12 +33,21 @@ module ActiveJob
       # * +:per+ - Required. A positive duration. Admissions are spaced <tt>per / to</tt>
       #   apart, which has to be at least 1 ms.
       # * +:burst+ - How many jobs a fully recovered budget admits at once. Defaults to 1.
+      # * +:key+ - Splits the budget, so each value gets one of its own. A String or Symbol
+      #   literal, or a Proc that receives the job's arguments, as in +limits_concurrency+.
+      # * +:group+ - Shares the budget with every class that names the same group. Takes
+      #   the same values as +:key+. Defaults to the class's name.
       #
-      # A subclass has its own budget, and can redeclare the limit. An invalid option
-      # raises +ArgumentError+. +perform_now+ and other adapters don't enforce it.
-      def limits_rate(to:, per:, burst: 1, **options)
-        if (planned = options.keys & %i[ key group name ]).any?
-          raise ArgumentError, "`#{planned.first}` isn't supported yet. Follow https://github.com/dtcristo/solid_queue-rate_limit/issues/3 for shared, keyed and multiple limits"
+      #   class SyncStripeCustomerJob < ApplicationJob
+      #     limits_rate to: 100, per: 1.minute, group: "Stripe", key: ->(account) { account }
+      #   end
+      #
+      # A subclass inherits the limit, key and group. Without a group it has its own
+      # budget, and it can redeclare the limit. An invalid option raises +ArgumentError+.
+      # +perform_now+ and other adapters don't enforce it, and never compute the key.
+      def limits_rate(to:, per:, burst: 1, key: nil, group: nil, **options)
+        if options.key?(:name)
+          raise ArgumentError, "`name` isn't supported yet. Follow https://github.com/dtcristo/solid_queue-rate_limit/issues/14 for multiple limits"
         elsif options.any?
           raise ArgumentError, "unknown keyword#{"s" if options.many?}: #{options.keys.map(&:inspect).join(", ")}"
         end
@@ -64,10 +78,17 @@ module ActiveJob
         self.rate_limit_to = to
         self.rate_limit_per = per
         self.rate_limit_burst = burst
+        self.rate_limit_key = key
+        self.rate_limit_group = group
       end
 
       def rate_limited?
         rate_limit_to.present?
+      end
+
+      # Whether a job's key is stored with it, rather than being the class's name
+      def rate_limit_keyed? # :nodoc:
+        rate_limited? && [ rate_limit_key, rate_limit_group ].any?
       end
 
       # The seconds between admissions
@@ -87,5 +108,45 @@ module ActiveJob
           end
         end
     end
+
+    # The key is computed once, when Solid Queue enqueues the job, and stored with it.
+    # A claim reads it without deserializing arguments, and a retry keeps it.
+    def serialize # :nodoc:
+      if self.class.rate_limit_keyed? && self.class.queue_adapter_name == "solid_queue"
+        @rate_limit_key ||= rate_limit_key.presence&.tap { |key| ensure_rate_limit_key_fits(key) }
+      end
+
+      @rate_limit_key ? super.merge(RATE_LIMIT_KEY => @rate_limit_key) : super
+    end
+
+    def deserialize(job_data) # :nodoc:
+      super
+      @rate_limit_key = job_data[RATE_LIMIT_KEY]
+    end
+
+    def rate_limit_key # :nodoc:
+      if self.class.rate_limit_keyed?
+        param = compute_concurrency_parameter(self.class.rate_limit_key)
+
+        case param
+        when ActiveRecord::Base
+          [ rate_limit_group, param.class.name, param.id ]
+        else
+          [ rate_limit_group, param ]
+        end.compact.join("/")
+      end
+    end
+
+    private
+      # Raised here rather than at claim, where it would fail every claim that took the job
+      def ensure_rate_limit_key_fits(key)
+        if (limit = SolidQueue::RateLimitState.columns_hash["key"].limit) && key.length > limit
+          raise ActiveRecord::ValueTooLong, "#{self.class.name}'s rate limit key is #{key.length} characters long, and solid_queue_rate_limits.key allows #{limit}"
+        end
+      end
+
+      def rate_limit_group
+        self.class.rate_limit_group ? compute_concurrency_parameter(self.class.rate_limit_group) : self.class.name
+      end
   end
 end

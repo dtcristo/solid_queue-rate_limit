@@ -84,6 +84,6 @@ class SolidQueue::LogSubscriber
   subscribe_log_level :defer_rate_limited, :debug
 
   def defer_rate_limited(event) # :nodoc:
-    debug formatted_event(event, action: "Defer rate-limited jobs", **event.payload.slice(:class_name, :job_ids, :size))
+    debug formatted_event(event, action: "Defer rate-limited jobs", **event.payload.slice(:class_name, :keys, :job_ids, :size))
   end
 end

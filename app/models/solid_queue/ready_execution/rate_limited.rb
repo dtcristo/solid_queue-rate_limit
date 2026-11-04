@@ -17,29 +17,31 @@ module SolidQueue
           limited = executions.select { |execution| (job = jobs[execution.job_id]) && job.concurrency_key.nil? && job_classes[job.class_name] }
           return [] if limited.empty?
 
+          keys = rate_limit_keys(limited, jobs, job_classes)
+
           next_checks = if RateLimitState.migrated?
-            check_rate_limits(limited, jobs, job_classes)
+            check_rate_limits(keys, jobs, job_classes)
           else
             log_pending_rate_limit_migrations
             limited.to_h { |execution| [ execution, 1.minute.from_now ] }
           end
 
-          schedule_rate_limited(next_checks, jobs)
+          schedule_rate_limited(next_checks, jobs, keys)
           next_checks.keys
         end
 
         private
           # Locks every limit the candidates need, in key order, then charges them in queue
-          # order. Returns when each rejected candidate should look again. The time is
-          # read once the locks are held, so claims that share a limit see it move on.
-          # A limit's key is its class's name, which a job enqueued under an alias shares.
-          def check_rate_limits(executions, jobs, job_classes)
-            states = RateLimitState.lock_all(executions.map { |execution| job_classes[jobs[execution.job_id].class_name].name }.uniq)
+          # order, each with its own class's settings. Returns when each rejected candidate
+          # should look again. The time is read once the locks are held, so claims that
+          # share a limit see it move on.
+          def check_rate_limits(keys, jobs, job_classes)
+            states = RateLimitState.lock_all(keys.values.uniq)
             now = Time.current
 
-            next_checks = executions.each_with_object({}) do |execution, deferred|
+            next_checks = keys.keys.each_with_object({}) do |execution, deferred|
               job_class = job_classes[jobs[execution.job_id].class_name]
-              state = states[job_class.name]
+              state = states[keys[execution]]
 
               unless state.admit(job_class.rate_limit_interval, job_class.rate_limit_burst, now)
                 deferred[execution] = state.defer(job_class.rate_limit_interval, job_class.rate_limit_burst, now)
@@ -50,14 +52,24 @@ module SolidQueue
             next_checks
           end
 
-          def schedule_rate_limited(next_checks, jobs)
+          # Returns each candidate's key. Only a class that declares key: or group: stores
+          # one with its jobs, so only theirs are read. Otherwise the key is the class's name,
+          # which a job enqueued under an alias, or before its class declared a key, shares.
+          def rate_limit_keys(executions, jobs, job_classes)
+            keyed = executions.select { |execution| job_classes[jobs[execution.job_id].class_name].rate_limit_keyed? }
+            stored = keyed.any? ? Job.where(id: keyed.map(&:job_id)).pluck(:id, :arguments).to_h { |id, arguments| [ id, arguments[ActiveJob::RateControls::RATE_LIMIT_KEY] ] } : {}
+
+            executions.index_with { |execution| stored[execution.job_id] || job_classes[jobs[execution.job_id].class_name].name }
+          end
+
+          def schedule_rate_limited(next_checks, jobs, keys)
             if next_checks.any?
               ScheduledExecution.insert_all(next_checks.map do |execution, scheduled_at|
                 jobs[execution.job_id].slice(:queue_name, :priority).merge(job_id: execution.job_id, scheduled_at: scheduled_at)
               end)
 
               next_checks.keys.group_by { |execution| jobs[execution.job_id].class_name }.each do |class_name, deferred|
-                SolidQueue.instrument(:defer_rate_limited, class_name: class_name, job_ids: deferred.map(&:job_id), size: deferred.size)
+                SolidQueue.instrument(:defer_rate_limited, class_name: class_name, keys: keys.values_at(*deferred).uniq, job_ids: deferred.map(&:job_id), size: deferred.size)
               end
             end
           end
