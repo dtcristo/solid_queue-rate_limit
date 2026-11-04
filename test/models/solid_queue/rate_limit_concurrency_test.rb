@@ -22,23 +22,40 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
     def perform; end
   end
 
+  # Records the time each admission was charged at, in the thread that charged it.
+  # A claim starts some time after that, so timing claims would misjudge the rate.
+  module RecordAdmissions
+    def admit(interval, burst, now)
+      super.tap { |admitted| Thread.current[:rate_limit_admissions]&.push([ key, now ]) if admitted }
+    end
+  end
+
+  SolidQueue::RateLimitState.prepend RecordAdmissions
+
   WORKERS = 6
   CAPACITY = 3
-
-  # Claims are timed in the claim's transaction, a moment after the limit's time is
-  # read, so two measured claims can be a little closer than they were admitted.
-  MEASUREMENT_TOLERANCE = 0.02
 
   setup do
     @processes = Array.new(WORKERS) { |i| SolidQueue::Process.register(kind: "Worker", pid: 42, name: "rate-limit-concurrency-worker-#{i}") }
     @claims = Queue.new
-    @subscriber = ActiveSupport::Notifications.subscribe("claim.solid_queue") do |_name, start, _finish, _id, payload|
-      payload[:claimed_job_ids].each { |job_id| @claims << [ job_id, start ] }
+    @admissions = Queue.new
+
+    @claim_subscriber = ActiveSupport::Notifications.subscribe("claim.solid_queue") do |*, payload|
+      payload[:claimed_job_ids].each { |job_id| @claims << job_id }
+    end
+
+    # Only admissions that commit charge the limit
+    @transaction_subscriber = ActiveSupport::Notifications.subscribe("transaction.active_record") do |*, payload|
+      if (admissions = Thread.current[:rate_limit_admissions])
+        admissions.each { |admission| @admissions << admission } if payload[:outcome] == :commit
+        admissions.clear
+      end
     end
   end
 
   teardown do
-    ActiveSupport::Notifications.unsubscribe(@subscriber)
+    ActiveSupport::Notifications.unsubscribe(@claim_subscriber)
+    ActiveSupport::Notifications.unsubscribe(@transaction_subscriber)
   end
 
   test "claiming threads and a dispatcher keep every limit, and claim every job once" do
@@ -101,12 +118,14 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
 
     def assert_claimed_once_within_limits(job_classes)
       claims = Array.new(@claims.size) { @claims.pop }
+      admissions = Array.new(@admissions.size) { @admissions.pop }
 
-      assert_equal job_classes.keys.sort, claims.map(&:first).sort, "every job is claimed exactly once"
+      assert_equal job_classes.keys.sort, claims.sort, "every job is claimed exactly once"
       assert SolidQueue::Job.where(finished_at: nil).none?
 
       [ TenASecondJob, FiveASecondJob ].each do |job_class|
-        times = claims.select { |job_id, _| job_classes[job_id] == job_class.name }.map(&:last).sort
+        times = admissions.select { |key, _| key == job_class.name }.map(&:last).sort
+        assert_equal job_classes.values.count(job_class.name), times.size, "#{job_class.name} is admitted once for each job"
         assert_within_rate job_class, times
         assert_operator times.last - times.first, :<=, (times.size - job_class.rate_limit_burst) * job_class.rate_limit_interval + 3, "#{job_class.name} drains in bounded time"
       end
@@ -120,6 +139,8 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
 
       workers = @processes.map do |process|
         Thread.new do
+          Thread.current[:rate_limit_admissions] = []
+
           SolidQueue::Record.connection_pool.with_connection do
             while running.call
               begin
@@ -153,14 +174,13 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
       Array.new(errors.size) { errors.pop }.map { |error| "#{error.class}: #{error.message}" }
     end
 
-    # GCRA admits at most burst + floor(w / T) in any window of length w
+    # GCRA admits at most burst + floor(w / T) in any window of length w. It's
+    # exact, so it's checked in rationals.
     def assert_within_rate(job_class, times)
-      interval = job_class.rate_limit_interval.to_f
-
       times.each_with_index do |first, i|
         times.each_with_index.drop(i + 1).each do |last, j|
-          allowed = job_class.rate_limit_burst + ((last - first + MEASUREMENT_TOLERANCE) / interval).floor
-          assert_operator j - i + 1, :<=, allowed, "#{job_class.name} claimed #{j - i + 1} jobs in #{(last - first).round(3)}s"
+          allowed = job_class.rate_limit_burst + ((last.to_r - first.to_r) / job_class.rate_limit_interval).floor
+          assert_operator j - i + 1, :<=, allowed, "#{job_class.name} admitted #{j - i + 1} jobs in #{(last - first).round(3)}s"
         end
       end
     end
