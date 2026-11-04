@@ -60,6 +60,16 @@ class SolidQueue::RateLimitCleanupTest < ActiveSupport::TestCase
     assert_equal [ 1.minute.from_now ], next_checks([ job ])
   end
 
+  test "a claim succeeds when the cleanup clears its budget while it runs" do
+    SolidQueue::RateLimitState.create!(key: "#{AccountJob.name}/a", tat: 1.second.ago)
+    jobs = Array.new(2) { AccountJob.perform_later("a") }
+
+    claimed = after_first_state_query(-> { SolidQueue::RateLimitState.clear_idle_in_batches }) { claim(10) }
+
+    assert_equal [ jobs.first.provider_job_id ], claimed.map(&:job_id)
+    assert_equal [ 1.minute.from_now ], next_checks(jobs.last(1))
+  end
+
   private
     # Runs interruption once, right after the block's first query on the state table,
     # so it lands between that query and the block's next one
