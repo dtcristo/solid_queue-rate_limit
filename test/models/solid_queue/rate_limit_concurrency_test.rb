@@ -42,30 +42,76 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
   end
 
   test "claiming threads and a dispatcher keep every limit, and claim every job once" do
-    # One limit's state exists already, and the other's is created by the claims
-    SolidQueue::RateLimitState.create!(key: TenASecondJob.name, tat: Time.current)
-
-    ActiveJob.perform_all_later(Array.new(30) { TenASecondJob.new } + Array.new(15) { FiveASecondJob.new } + Array.new(30) { UnlimitedJob.new })
-    ActiveJob.perform_all_later(Array.new(30) { [ TenASecondJob.new, FiveASecondJob.new, UnlimitedJob.new ].sample })
-    job_classes = SolidQueue::Job.pluck(:id, :class_name).to_h
+    job_classes = enqueue_jobs
 
     errors = run_workers_and_dispatcher(until_done: job_classes.size, timeout: 15.seconds)
 
-    claims = []
-    claims << @claims.pop until @claims.empty?
-
     assert_empty errors
-    assert_equal job_classes.keys.sort, claims.map(&:first).sort, "every job is claimed exactly once"
-    assert SolidQueue::Job.where(finished_at: nil).none?
+    assert_claimed_once_within_limits job_classes
+  end
 
-    { TenASecondJob => job_classes.values.count(TenASecondJob.name), FiveASecondJob => job_classes.values.count(FiveASecondJob.name) }.each do |job_class, count|
-      times = claims.select { |job_id, _| job_classes[job_id] == job_class.name }.map(&:last).sort
-      assert_within_rate job_class, times
-      assert_operator times.last - times.first, :<=, (count - job_class.rate_limit_burst) * job_class.rate_limit_interval + 3, "#{job_class.name} drains in bounded time"
+  # Claims open IMMEDIATE transactions on Rails 8, but another connection can still
+  # hold a deferred one that starts as a reader and then needs the write lock.
+  if ENV["TARGET_DB"] == "sqlite"
+    test "claims wait out SQLite transactions that upgrade from reader to writer" do
+      job_classes = enqueue_jobs
+      upgrades = Concurrent::AtomicFixnum.new
+      stop = Concurrent::AtomicBoolean.new
+
+      upgrader = Thread.new do
+        SolidQueue::Record.connection_pool.with_connection do |connection|
+          until stop.true?
+            begin
+              connection.execute("BEGIN DEFERRED TRANSACTION")
+              connection.select_value("SELECT COUNT(*) FROM solid_queue_ready_executions")
+              sleep 0.005
+              connection.execute("INSERT INTO solid_queue_pauses (queue_name, created_at) VALUES ('contention', CURRENT_TIMESTAMP)")
+              upgrades.increment
+            rescue ActiveRecord::StatementInvalid
+              # This transaction is the one SQLite refuses, not the claims
+            ensure
+              connection.execute("ROLLBACK TRANSACTION") rescue nil
+            end
+          end
+        end
+      end
+
+      errors = run_workers_and_dispatcher(until_done: job_classes.size, timeout: 15.seconds)
+      stop.make_true
+      upgrader.join
+
+      assert_operator upgrades.value, :>, 0
+      assert_empty errors
+      assert_claimed_once_within_limits job_classes
+      assert SolidQueue::Pause.none?
     end
   end
 
   private
+    # Two limited classes in overlapping batches, and unlimited jobs among them.
+    # One limit's state exists already, and the other's is created by the claims.
+    def enqueue_jobs
+      SolidQueue::RateLimitState.create!(key: TenASecondJob.name, tat: Time.current)
+
+      ActiveJob.perform_all_later(Array.new(30) { TenASecondJob.new } + Array.new(15) { FiveASecondJob.new } + Array.new(30) { UnlimitedJob.new })
+      ActiveJob.perform_all_later(Array.new(30) { [ TenASecondJob.new, FiveASecondJob.new, UnlimitedJob.new ].sample })
+
+      SolidQueue::Job.pluck(:id, :class_name).to_h
+    end
+
+    def assert_claimed_once_within_limits(job_classes)
+      claims = Array.new(@claims.size) { @claims.pop }
+
+      assert_equal job_classes.keys.sort, claims.map(&:first).sort, "every job is claimed exactly once"
+      assert SolidQueue::Job.where(finished_at: nil).none?
+
+      [ TenASecondJob, FiveASecondJob ].each do |job_class|
+        times = claims.select { |job_id, _| job_classes[job_id] == job_class.name }.map(&:last).sort
+        assert_within_rate job_class, times
+        assert_operator times.last - times.first, :<=, (times.size - job_class.rate_limit_burst) * job_class.rate_limit_interval + 3, "#{job_class.name} drains in bounded time"
+      end
+    end
+
     def run_workers_and_dispatcher(until_done:, timeout:)
       errors = Queue.new
       claimed = Concurrent::AtomicFixnum.new
