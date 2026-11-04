@@ -69,7 +69,7 @@ class ReleaseHelpers < Rake::TaskLib
   end
 
   def notes_for(version)
-    changelog[/^## \[#{Regexp.escape(version)}\] - .+?\n(.+?)^(?:## \[|\[Unreleased\]:)/m, 1].gsub(/^### /, "## ").strip
+    changelog[/^## \[#{Regexp.escape(version)}\] - .+?\n(.+?)(?:^## \[|^\[Unreleased\]:|\z)/m, 1].gsub(/^### /, "## ").strip
   end
 
   def changelog
