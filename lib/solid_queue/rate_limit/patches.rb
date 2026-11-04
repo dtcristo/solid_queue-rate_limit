@@ -50,7 +50,28 @@ module SolidQueue
           end
       end
 
+      # Prepended rather than added to the adapter, because RecurringTask calls
+      # Job.enqueue directly. A limited job can't be admitted without the schema,
+      # so it's better to find out when it's enqueued.
+      module Enqueuing
+        def enqueue_all(active_jobs)
+          ensure_rate_limitable if active_jobs.any? { |active_job| active_job.class.rate_limited? }
+          super
+        end
+
+        def enqueue(active_job, **)
+          ensure_rate_limitable if active_job.class.rate_limited?
+          super
+        end
+
+        private
+          def ensure_rate_limitable
+            raise RateLimitState::PendingMigrations unless RateLimitState.migrated?
+          end
+      end
+
       def self.apply
+        SolidQueue::Job.singleton_class.prepend Enqueuing
         SolidQueue::ReadyExecution.include SolidQueue::ReadyExecution::RateLimited
         SolidQueue::ReadyExecution.singleton_class.prepend Claiming
       end
