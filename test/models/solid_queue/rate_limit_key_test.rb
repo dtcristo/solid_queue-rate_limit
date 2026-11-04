@@ -11,6 +11,12 @@ class SolidQueue::RateLimitKeyTest < ActiveSupport::TestCase
     def perform(account); end
   end
 
+  class ClassLimitedJob < ApplicationJob
+    limits_rate to: 1, per: 10.seconds
+
+    def perform; end
+  end
+
   class StripeChargeJob < ApplicationJob
     limits_rate to: 1, per: 10.seconds, group: "Stripe"
 
@@ -264,14 +270,15 @@ class SolidQueue::RateLimitKeyTest < ActiveSupport::TestCase
   end
 
   test "a claim reads the stored keys of keyed jobs only, in one query" do
-    PerAccountJob.perform_later("a")
-    StripeChargeJob.perform_later("b")
-    AddToBufferJob.perform_later("unlimited")
+    keyed = [ PerAccountJob.perform_later("a"), StripeChargeJob.perform_later("b") ]
+    others = [ ClassLimitedJob.perform_later, AddToBufferJob.perform_later("unlimited") ]
 
-    queries = capture_queries { claim }
+    # Payloads that can't be parsed fail any claim that reads them
+    SolidQueue::Job.where(id: provider_ids(others)).update_all("arguments = '{'")
+
+    queries = capture_queries { assert_equal provider_ids(keyed + others).sort, claim.map(&:job_id).sort }
 
     assert_equal 1, queries.count("SolidQueue::Job Pluck")
-    assert_equal 1, queries.count("SolidQueue::Job Load")
   end
 
   test "a key that isn't a String, Symbol or Proc is nil, as in limits_concurrency" do
