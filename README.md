@@ -123,7 +123,7 @@ Use this when a backlog builds up and has to drain at the declared rate.
 
 ```ruby
 class SendWebhookJob < ApplicationJob
-  # 1 + to × polling_interval / per = 1 + 5 × 1 / 1 = 6, for the dispatcher's default 1-second poll
+  # 5 × (1 + 0.1) / 1 = 5.5, rounded up, for the default 1-second dispatcher poll and 0.1-second worker poll
   limits_rate to: 5, per: 1.second, burst: 6
 
   def perform(webhook_id)
@@ -132,7 +132,7 @@ class SendWebhookJob < ApplicationJob
 end
 ```
 
-If 6 jobs at once is too many for the API, make the dispatcher poll more often instead. With a 0.2-second poll, `1 + 5 × 0.2 / 1 = 2`, so `limits_rate to: 5, per: 1.second, burst: 2` is enough:
+If 6 jobs at once is too many for the API, make the dispatcher poll more often instead. With a 0.2-second poll, `5 × (0.2 + 0.1) / 1 = 1.5`, which rounds up to 2, so `limits_rate to: 5, per: 1.second, burst: 2` is enough:
 
 ```yaml
 # config/queue.yml
@@ -174,9 +174,11 @@ Some things fall outside it:
 
 A job that reaches a worker while the budget has room runs straight away, whatever the burst. A backlog is different. Its jobs come back from waiting through the dispatcher, which promotes due jobs once per `polling_interval` (1 second by default), and a worker claims them shortly after.
 
-`burst` also sets how early a job can reach the gate and still get in: one interval for each burst above 1. With `burst: 1` there's no slack. A waiting job that arrives even a millisecond before the interval since the last claim has passed waits again, behind the rest of the backlog. Dispatch and claim delays vary by tens of milliseconds, so this happens to a good share of waiting jobs. Polling more often doesn't help, because the delays still vary.
+`burst` also sets how early a job can reach the gate and still get in. Each burst above 1 allows one more interval `per / to`. With `burst: 1` there's no slack. A waiting job that arrives even a millisecond before the interval since the last claim has passed waits again, behind the rest of the backlog. Dispatch and claim delays vary by tens of milliseconds, so this happens to a good share of waiting jobs. Polling more often doesn't help, because the delays still vary.
 
-For a backlog to drain at the full rate, set `burst` to at least `1 + to × polling_interval / per`, rounded up, using the dispatcher's `polling_interval`. For any rate up to one job per polling interval, that's `burst: 2`. The cost is that a quiet budget lets that many jobs through at once.
+For a backlog to drain at the full rate, `burst` has to cover two things. A dispatcher poll makes about `to × polling_interval / per` jobs due at once, and one claim takes them together. On top of that, the slack has to cover how much a worker's claim delay varies, which is up to the worker's own `polling_interval`. So set `burst` to at least `to × (dispatcher polling_interval + worker polling_interval) / per`, rounded up, and to at least 2. With Solid Queue's defaults of 1 and 0.1 seconds, that's `burst: 2` for 1 job a second, and `burst: 6` for 5. The cost is that a quiet budget lets that many jobs through at once.
+
+This is a rule of thumb that fits the measurements below and the recipe test's simulation, not a bound. Slow claims or busy workers can need more. In the simulation, 100 jobs a second with a 0.1-second dispatcher poll fell behind with `burst: 11` and kept up with `burst: 20`.
 
 These numbers come from 30 to 60 waiting jobs, with one worker polling every 0.1 seconds, on SQLite:
 
@@ -234,7 +236,7 @@ limits_rate to:, per:, burst: 1
 
 An invalid option raises `ArgumentError` when the class loads. The class gets `rate_limit_to`, `rate_limit_per`, `rate_limit_burst` and `rate_limited?` to read them back.
 
-Changing a limit and deploying applies to the next claim. A looser limit applies at once, without paying off the debt the old one built up. A tighter one starts from the budget as the old limit left it.
+Changing a limit and deploying applies to the next claim. A looser limit doesn't pay off all the debt the old one built up. The claim caps it at `burst` intervals of the new limit, so new admissions start within one new interval. Jobs already waiting keep the next checks the old limit gave them, and new waiting jobs get slots after those, so a backlog can take up to 5 minutes to speed up. A tighter limit starts from the budget as the old one left it.
 
 ## Rules and limitations
 

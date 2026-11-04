@@ -115,13 +115,15 @@ With `T = per / to` and `τ = (burst - 1) × T`:
 2. Admit when `tat <= now + τ`, and then set `tat = max(tat, now) + T`.
 3. Round `tat` up to the microsecond.
 
-From a full budget that admits `burst` jobs at once, then one every `T`. In any window of length `w`, it admits at most `burst + floor(w / T)`: after `i` admissions starting at `t1`, `tat` is at least `t1 + i × T`, and the next one needs `tat <= t + τ`, so it can't come before `t1 + (i - burst + 1) × T`.
+From a full budget that admits `burst` jobs at once, then one every `T`. In any window of length `w`, it admits at most `burst + floor(w / T)`.
 
-The clamp never changes anything under a constant limit, because an admission leaves `tat` at most `now + burst × T`. It only matters after a deploy loosens the limit. Without it, debt built up under the old limit would hold the new one back, and with a much smaller `T` that could last minutes.
+Here's why. Say the first admission in the window is at `t1`. After `i` admissions, `tat` is at least `t1 + i × T`. The next admission at time `t` needs `tat <= t + τ`. So it can't come before `t1 + (i - burst + 1) × T`.
+
+The clamp never changes anything under a constant limit, because an admission leaves `tat` at most `now + burst × T`. It only matters after a deploy loosens the limit. Without it, debt built up under the old limit would hold the new one back, and with a much smaller `T` that could last minutes. With it, the debt left is at most `burst` new intervals, so the next admission is at most one new interval away. Slots handed out under the old limit stay, and new slots go after them, so waiting jobs can take up to 5 minutes to catch up.
 
 Rounding down would drop a little debt on every admission, and datetime columns store microseconds. So `tat` rounds up, and a limit can only err on the slow side. `T` has to be at least 1 ms, so rounding never takes a large share of it.
 
-`T` is a `Rational`, so `to: 3, per: 1.second` doesn't drift.
+`T` is a `Rational`, so `to: 3, per: 1.second` carries no floating-point error. Rounding still adds up to 1 µs per admission, always on the slow side. Three admissions at `T = 1/3` second leave `tat` at 1.000002 seconds.
 
 ## Deferral and staggering
 
@@ -163,7 +165,7 @@ Without eager loading, a class may not load until its job is claimed, so the gem
 
 ## Missing migration
 
-`SolidQueue::Job.enqueue` and `enqueue_all` raise `RateLimitState::PendingMigrations` for a limited class while the table is missing. They're prepended on the model rather than the adapter, because `RecurringTask` calls `Job.enqueue` directly. It's best effort: a gem that enqueues through its own path, such as solid_queue-coalesce's coalesced enqueues, can skip it.
+`SolidQueue::Job.enqueue` and `enqueue_all` raise `RateLimitState::PendingMigrations` for a limited class while the table is missing. They're prepended on the model rather than the adapter, because `RecurringTask` calls `Job.enqueue` directly. It's best effort. A gem that enqueues through its own path, such as solid_queue-coalesce's coalesced enqueues, can skip it.
 
 A claim fails closed. Limited jobs that reach a worker without the table get scheduled a minute out, without any state, and each process logs one error. `migrated?` remembers only a true answer, but Active Record's schema cache remembers a missing table too, so a process has to restart to see the table.
 
@@ -179,15 +181,15 @@ A ready job can still have a concurrency key if its class switched from `limits_
 
 ## Re-claims
 
-Anything that brings a job back to ready is charged again: a `retry_on` retry, which enqueues a new job, a failed job you retry, and a claim released when a worker shuts down. The gem doesn't record which jobs it admitted. That's what makes the guarantee one about claims, not jobs, and it costs nothing to keep.
+A job that comes back to ready is charged again. That covers a `retry_on` retry, which enqueues a new job, a failed job you retry, and a claim released when a worker shuts down. The gem doesn't record which jobs it admitted. That's what makes the guarantee one about claims, not jobs, and it costs nothing to keep.
 
 ## Throughput with a small burst
 
 Waiting jobs come back through the dispatcher, and a worker claims them a little after each dispatcher poll. With `burst: 1`, `τ` is 0. Admitting a job sets `tat` to its claim time plus `T`, but the next waiting job's slot was set one `T` after the previous slot. It arrives at its slot plus its own delay, so it's admitted only if its delay is at least the previous job's. Otherwise it gets the slot after all the others, and the slot it missed goes unused.
 
-Delays come from the dispatcher's poll and the worker's poll, and they vary by tens of milliseconds. Lowering the dispatcher's `polling_interval` doesn't help, because the delays still vary. Against a real supervisor on SQLite, with one worker polling every 0.1 seconds, `to: 1, per: 1.second` drained a backlog at 0.55 jobs per second with a 1-second dispatcher poll, and at 0.53 with a 0.1-second one. `burst: 2` drained it at 0.95 and 1.0.
+Delays come from the dispatcher's poll and the worker's poll, and they vary by up to the worker's polling interval. Lowering the dispatcher's `polling_interval` doesn't help, because the delays still vary. Against a real supervisor on SQLite, with one worker polling every 0.1 seconds, `to: 1, per: 1.second` drained a backlog at 0.55 jobs per second with a 1-second dispatcher poll, and at 0.53 with a 0.1-second one. `burst: 2` drained it at 0.95 and 1.0.
 
-A dispatcher poll also makes about `to × polling_interval / per` jobs due at once, and one claim takes them together, so the budget has to admit that many at once. One interval of slack on top absorbs the variation in delays. That's the rule in the README: `burst >= 1 + to × polling_interval / per`, rounded up. The recipe test replays it with fixed delays in simulated time.
+A dispatcher poll also makes about `to × polling_interval / per` jobs due at once, and one claim takes them together, so the budget has to admit that many at once. The slack on top has to cover the variation in claim delays, up to the worker's polling interval, which is `to × worker polling_interval / per` intervals. That's the rule of thumb in the README: `burst >= to × (dispatcher polling_interval + worker polling_interval) / per`, rounded up, and at least 2. The recipe test replays it with fixed delays in simulated time. It isn't a bound, because a slow claim can vary its delay by more than a polling interval.
 
 ## Alternatives considered
 

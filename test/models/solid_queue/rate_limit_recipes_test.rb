@@ -44,6 +44,19 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
     def perform; end
   end
 
+  # 100 × (0.1 + 0.1) / 1 = 20, and 11 only covers the dispatcher's poll
+  class HundredBurstTwentyJob < ApplicationJob
+    limits_rate to: 100, per: 1.second, burst: 20
+
+    def perform; end
+  end
+
+  class HundredBurstElevenJob < ApplicationJob
+    limits_rate to: 100, per: 1.second, burst: 11
+
+    def perform; end
+  end
+
   CLAIM_DELAYS = [ 0.08, 0.02, 0.05 ]
 
   setup do
@@ -107,6 +120,19 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
 
     assert_operator claims.count { |_, class_name| class_name == OneBurstJob.name }, :<, 25
     assert_equal 30, claims.count { |_, class_name| class_name == TwoBurstJob.name }
+  end
+
+  test "at a high rate the burst also covers the worker's poll" do
+    ActiveJob.perform_all_later(Array.new(500) { HundredBurstTwentyJob.new })
+    fast = run_dispatcher_and_worker(5.seconds, poll: 0.1)
+    destroy_records
+
+    ActiveJob.perform_all_later(Array.new(500) { HundredBurstElevenJob.new })
+    slow = run_dispatcher_and_worker(5.seconds, poll: 0.1)
+
+    assert_equal 500, fast.size
+    assert_operator fast.max, :<=, (500 - 20) / 100.0 + 0.3
+    assert_operator slow.size, :<, 450
   end
 
   private
