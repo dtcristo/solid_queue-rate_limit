@@ -36,7 +36,11 @@ module SolidQueue
           insert_all(missing.map { |key| { key: key, tat: Time.current } })
         end
 
-        where(key: keys).order(:key).lock.index_by(&:key)
+        states = where(key: keys).order(:key).lock.index_by(&:key)
+
+        # Under a case-insensitive collation, like MySQL's default, a key can match
+        # a row spelled differently, and then the two share a budget
+        keys.index_with { |key| states[key] || states.fetch(where(key: key).pick(:key)) }
       end
     end
 

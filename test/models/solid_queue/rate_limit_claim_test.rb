@@ -13,6 +13,18 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     end
   end
 
+  class CasedJob < ApplicationJob
+    limits_rate to: 1, per: 10.seconds
+
+    def perform; end
+  end
+
+  class CASEDJob < ApplicationJob
+    limits_rate to: 1, per: 10.seconds
+
+    def perform; end
+  end
+
   # Kept after a rename, for jobs enqueued under the old name
   RenamedLimitedJob = LimitedJob
 
@@ -205,20 +217,37 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     assert_equal 2, claimed.size
   end
 
-  test "a deadlock while looking again returns what was claimed before it" do
-    limited = 3.times.map { |i| LimitedJob.perform_later(i) }
-    UnlimitedJob.perform_later("unlimited")
-    candidates = SolidQueue::ReadyExecution.ordered.limit(3).select(:id, :job_id).to_a
-    SolidQueue::ReadyExecution.stubs(:select_candidates).returns(candidates).then.raises(ActiveRecord::Deadlocked)
+  test "a deadlock while looking again returns what was claimed before it, and rolls back only its own pass" do
+    limited = 4.times.map { |i| LimitedJob.perform_later(i) }
 
-    assert_equal provider_ids(limited.first(2)), claim(3).map(&:job_id)
+    claimed = deadlocking_on("SolidQueue::ScheduledExecution Insert", occurrence: 2) { claim(3) }
+
+    assert_equal provider_ids(limited.first(2)), claimed.map(&:job_id)
+    assert_equal [ limited.third.provider_job_id ], SolidQueue::ScheduledExecution.pluck(:job_id)
+    assert_equal [ limited.fourth.provider_job_id ], SolidQueue::ReadyExecution.pluck(:job_id)
+    assert_equal Time.current + 10.seconds, SolidQueue::RateLimitState.sole.deferred_until
   end
 
-  test "a deadlock in a claim's first look raises" do
-    LimitedJob.perform_later(0)
-    SolidQueue::ReadyExecution.stubs(:select_candidates).raises(ActiveRecord::Deadlocked)
+  test "a deadlock in a claim's first look raises and rolls it back" do
+    3.times { |i| LimitedJob.perform_later(i) }
 
-    assert_raises(ActiveRecord::Deadlocked) { claim(3) }
+    assert_raises(ActiveRecord::Deadlocked) do
+      deadlocking_on("SolidQueue::ScheduledExecution Insert", occurrence: 1) { claim(3) }
+    end
+
+    assert_equal 3, SolidQueue::ReadyExecution.count
+    assert_equal 0, SolidQueue::ClaimedExecution.count
+    assert_equal 0, SolidQueue::RateLimitState.count
+  end
+
+  test "classes whose names differ only in case can be claimed together" do
+    jobs = [ CasedJob.perform_later, CASEDJob.perform_later ]
+
+    claimed = claim(10)
+
+    # MySQL's default collation compares keys without case, so there they share a budget
+    expected = SolidQueue::Record.connection.adapter_name.match?(/mysql/i) ? jobs.first(1) : jobs
+    assert_equal provider_ids(expected), claimed.map(&:job_id)
   end
 
   test "without any limit declared, an eager-loaded app claims with exactly Solid Queue's queries" do
@@ -231,6 +260,17 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
   end
 
   private
+    # Raises once the given query has run, as InnoDB or PostgreSQL would for a deadlock victim
+    def deadlocking_on(query_name, occurrence:, &block)
+      seen = 0
+      subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
+        raise ActiveRecord::Deadlocked, "Deadlock found" if payload[:name] == query_name && (seen += 1) == occurrence
+      end
+      block.call
+    ensure
+      ActiveSupport::Notifications.unsubscribe(subscriber)
+    end
+
     def capture_queries(&block)
       queries = []
       subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") { |event| queries << event.payload[:name] }
