@@ -119,7 +119,7 @@ From a full budget that admits `burst` jobs at once, then one every `T`. In any 
 
 Here's why. Say the first admission in the window is at `t1`. After `i` admissions, `tat` is at least `t1 + i × T`. The next admission at time `t` needs `tat <= t + τ`. So it can't come before `t1 + (i - burst + 1) × T`.
 
-The clamp never changes anything under a constant limit, because an admission leaves `tat` at most `now + burst × T`. It only matters after a deploy loosens the limit. Without it, debt built up under the old limit would hold the new one back, and with a much smaller `T` that could last minutes. With it, the debt left is at most `burst` new intervals, so the next admission is at most one new interval away. Slots handed out under the old limit stay, and new slots go after them, so waiting jobs can take up to 5 minutes to catch up.
+The clamp never changes anything under a constant limit, because an admission leaves `tat` at most `now + burst × T`. It only matters after a deploy loosens the limit. Without it, debt built up under the old limit would hold the new one back, and with a much smaller `T` that could last minutes. With it, the debt left is at most `burst` new intervals, rounded up to the microsecond, so the next admission is at most one new interval and a microsecond away. Slots handed out under the old limit stay, and new slots go after them, so waiting jobs can take up to 5 minutes to catch up.
 
 Rounding down would drop a little debt on every admission, and datetime columns store microseconds. So `tat` rounds up, and a limit can only err on the slow side. `T` has to be at least 1 ms, so rounding never takes a large share of it.
 

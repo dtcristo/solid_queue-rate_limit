@@ -236,7 +236,7 @@ limits_rate to:, per:, burst: 1
 
 An invalid option raises `ArgumentError` when the class loads. The class gets `rate_limit_to`, `rate_limit_per`, `rate_limit_burst` and `rate_limited?` to read them back.
 
-Changing a limit and deploying applies to the next claim. A looser limit doesn't pay off all the debt the old one built up. The claim caps it at `burst` intervals of the new limit, so new admissions start within one new interval. Jobs already waiting keep the next checks the old limit gave them, and new waiting jobs get slots after those, so a backlog can take up to 5 minutes to speed up. A tighter limit starts from the budget as the old one left it.
+Changing a limit and deploying applies to the next claim. A looser limit doesn't pay off all the debt the old one built up. The claim caps it at `burst` intervals of the new limit, rounded up to the microsecond, so new admissions start within one new interval and a microsecond. Jobs already waiting keep the next checks the old limit gave them, and new waiting jobs get slots after those, so a backlog can take up to 5 minutes to speed up. A tighter limit starts from the budget as the old one left it.
 
 ## Rules and limitations
 
