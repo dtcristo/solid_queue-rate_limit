@@ -17,13 +17,11 @@ module SolidQueue
           limited = executions.select { |execution| jobs[execution.job_id].concurrency_key.nil? && job_classes[jobs[execution.job_id].class_name] }
           return [] if limited.empty?
 
-          now = Time.current
-          next_checks = limited.to_h { |execution| [ execution, now + 1.minute ] }
-
-          if RateLimitState.migrated?
-            next_checks = check_rate_limits(limited, jobs, job_classes, now)
+          next_checks = if RateLimitState.migrated?
+            check_rate_limits(limited, jobs, job_classes)
           else
             log_pending_rate_limit_migrations
+            limited.to_h { |execution| [ execution, 1.minute.from_now ] }
           end
 
           schedule_rate_limited(next_checks, jobs)
@@ -32,9 +30,11 @@ module SolidQueue
 
         private
           # Locks every limit the candidates need, in key order, then charges them in queue
-          # order. Returns when each rejected candidate should look again.
-          def check_rate_limits(executions, jobs, job_classes, now)
-            states = RateLimitState.lock_all(executions.map { |execution| jobs[execution.job_id].class_name }.uniq, now)
+          # order. Returns when each rejected candidate should look again. The time is
+          # read once the locks are held, so claims that share a limit see it move on.
+          def check_rate_limits(executions, jobs, job_classes)
+            states = RateLimitState.lock_all(executions.map { |execution| jobs[execution.job_id].class_name }.uniq)
+            now = Time.current
 
             next_checks = executions.each_with_object({}) do |execution, deferred|
               job_class = job_classes[jobs[execution.job_id].class_name]
