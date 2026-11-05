@@ -8,7 +8,8 @@ module SolidQueue
       class_methods do
         # Moves the candidates whose class is over its rate to scheduled executions,
         # leaving their jobs' own scheduled_at as it is, and returns them. Called inside
-        # the claim's transaction, after the candidates have been locked.
+        # the claim's transaction, after the candidates have been locked. The deferred
+        # jobs that hold a semaphore are kept for release_concurrency_locks.
         def defer_rate_limited(executions)
           jobs = Job.where(id: executions.map(&:job_id)).select(:id, :class_name, :queue_name, :priority, :concurrency_key).index_by(&:id)
           job_classes = jobs.values.map(&:class_name).uniq.index_with { |class_name| rate_limited_job_class(class_name) }.compact
@@ -26,8 +27,28 @@ module SolidQueue
           end
 
           schedule_rate_limited(next_checks, jobs, keys)
-          release_concurrency_locks(next_checks.keys.map(&:job_id).select { |job_id| jobs[job_id].concurrency_key })
+          hold_concurrency_locks(next_checks.keys.map(&:job_id).select { |job_id| jobs[job_id].concurrency_key })
           next_checks.keys
+        end
+
+        # A deferred job gives its semaphore back while it waits, so the semaphore can't expire
+        # and let a second job with its key run. It takes one again when it's dispatched.
+        #
+        # Called once the claim has committed, as Solid Queue unblocks a finished job's next
+        # one after its own transaction. Inside the claim, the release and the wake would lock
+        # semaphores and insert ready executions while holding ready executions and rate
+        # limits, and on MySQL that deadlocks with other claims and the dispatcher.
+        #
+        # The claim has committed, so an error is logged rather than raised, and the claim
+        # returns what it claimed.
+        def release_concurrency_locks
+          ActiveSupport::IsolatedExecutionState.delete(:solid_queue_rate_limit_releases)&.each do |job|
+            job.unblock_next_blocked_job
+          rescue StandardError, ScriptError => error
+            raise if error.is_a?(ActiveRecord::ActiveRecordError) && connection.transaction_open?
+
+            SolidQueue.logger&.error("Couldn't release the semaphore of job #{job.id}, or the next job blocked on #{job.concurrency_key}: #{error.class}: #{error.message}")
+          end
         end
 
         private
@@ -74,25 +95,13 @@ module SolidQueue
             end
           end
 
-          # A deferred job gives its semaphore back while it waits, so the semaphore can't expire
-          # and let a second job with its key run. It takes one again when it's dispatched.
-          # Going through them by concurrency key, as dispatch_all_one_by_one does, makes
-          # claims that release the same semaphores take them in the same order.
-          #
-          # This is Job#unblock_next_blocked_job, with the wake in a savepoint of its own,
-          # so a wake that fails doesn't take the release back with it.
-          def release_concurrency_locks(job_ids)
+          # Loaded inside the claim, so each job keeps the semaphore it held when it was deferred,
+          # even if the dispatcher brings it back and it takes another before the release. Going
+          # through them by concurrency key, as dispatch_all_one_by_one does, makes claims that
+          # release the same semaphores take them in the same order.
+          def hold_concurrency_locks(job_ids)
             if job_ids.any?
-              Job.where(id: job_ids).sort_by { |job| [ job.concurrency_key, job.id ] }.each do |job|
-                if job.send(:release_concurrency_lock)
-                  transaction(requires_new: true) { BlockedExecution.release_one(job.concurrency_key) }
-                end
-              rescue ActiveRecord::ActiveRecordError
-                raise
-              rescue StandardError, ScriptError => error
-                # A blocked job whose class can't be loaded stays blocked, rather than failing the claim
-                SolidQueue.logger&.error("Couldn't release the next job blocked on #{job.concurrency_key}: #{error.class}: #{error.message}")
-              end
+              ActiveSupport::IsolatedExecutionState[:solid_queue_rate_limit_releases] = Job.where(id: job_ids).sort_by { |job| [ job.concurrency_key, job.id ] }
             end
           end
 

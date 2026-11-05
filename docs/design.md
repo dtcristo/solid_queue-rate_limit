@@ -104,10 +104,11 @@ sequenceDiagram
     W->>S: save changed states
     W->>X: insert deferred jobs at their slots
     W->>J: load deferred jobs that have a concurrency key
-    W->>M: give each semaphore back, by concurrency key
-    W->>B: wake the next blocked job for each key, SKIP LOCKED
     W->>C: claim the rest, Solid Queue's insert
     W->>R: delete ready rows, claimed and deferred
+    Note over W: commit
+    W->>M: give each semaphore back, by concurrency key
+    W->>B: wake the next blocked job for each key, SKIP LOCKED
 ```
 
 The candidates come in Solid Queue's queue order, and the gem charges them in that order. A job is limited when its class loads, is an `ActiveJob::Base` subclass, and declares `limits_rate`. A concurrency key doesn't change that. See [Concurrency keys](#concurrency-keys).
@@ -123,10 +124,11 @@ flowchart LR
     Ready["Ready rows,<br/>SKIP LOCKED"] --> Insert["Missing state rows,<br/>inserted in key order"]
     Insert --> Lock["State rows,<br/>locked in key order"]
     Lock --> Scheduled["Scheduled inserts"]
-    Scheduled --> Semaphores["Deferred jobs' semaphores,<br/>by concurrency key"]
-    Semaphores --> Claimed["Claimed inserts"]
+    Scheduled --> Claimed["Claimed inserts"]
     Claimed --> Deletes["Ready deletes"]
 ```
+
+The semaphores of deferred jobs are given back after the pass commits, so a claim never holds a semaphore. See [Concurrency keys](#concurrency-keys).
 
 Ready rows never wait, because `SKIP LOCKED` passes over a row another claim holds. State rows are taken only by claims and the cleanup, always in key order, so two claims that share several limits can't wait on each other in a cycle. With Solid Queue's `use_skip_locked` off, claims wait for ready rows too, but a claim that holds a state row never asks for a ready row after it, so that still can't form a cycle.
 
@@ -134,16 +136,16 @@ Semaphores are where a claim meets the rest of Solid Queue. Each entry point tha
 
 | Entry point | Order | Who retries a deadlock |
 | --- | --- | --- |
-| Claim | Ready rows, `SKIP LOCKED`. Jobs, read. State rows, in key order. Scheduled inserts. Then for each deferred job with a concurrency key, by `[concurrency_key, id]`: its semaphore, the next blocked row for its key with `SKIP LOCKED`, the woken job's semaphore, which is the same row, its `arguments`, its ready insert and its blocked delete. Last, claimed inserts and ready deletes | The first pass runs once more. A later pass rolls back and the claim returns what earlier passes committed. See [Deadlocks](#deadlocks) |
+| Claim | Ready rows, `SKIP LOCKED`. Jobs, read. State rows, in key order. Scheduled inserts, claimed inserts and ready deletes. Then, after the commit, for each deferred job with a concurrency key, by `[concurrency_key, id]`: its semaphore, and blocked maintenance for its key, as after a job finishes | The first pass runs once more. A later pass rolls back and the claim returns what earlier passes committed. See [Deadlocks](#deadlocks) |
 | Enqueue | Job inserts. Then ready inserts for jobs without a concurrency key, and for each job with one, by `[concurrency_key, id]`: its semaphore, its `arguments`, and its ready or blocked insert | Nobody. The enqueue raises, as in Solid Queue |
 | Scheduled dispatch | Scheduled rows, `SKIP LOCKED`. Then as an enqueue, and last the scheduled deletes | `dispatch_next_batch` runs the batch once more |
 | Blocked maintenance | For each key, in a transaction of its own: the next blocked row with `SKIP LOCKED`, its semaphore, its `arguments`, its ready insert and its blocked delete | Nobody. Solid Queue's maintenance logs the error and runs again at its next interval |
 | Job finish | The claimed row and the job, in one transaction. Then, outside it, the job's semaphore, and blocked maintenance for its key | Nobody, as in Solid Queue |
 | Discard | Ready rows, locked in `job_id` order without `SKIP LOCKED`. Then for each job, by id: its semaphore and blocked maintenance for its key. Last, job and ready deletes | Nobody. The discard raises, as in Solid Queue |
 
-A claim takes one semaphore for each deferred job, and a wake takes the same one again, so claims that release several keys take them in the order a dispatch does, and can't wait on each other or on a dispatch in a cycle through semaphores alone. Discard goes by job id, as in Solid Queue, so it can deadlock with a claim or a dispatch that holds several keys, as it already can with a dispatch.
+A claim gives semaphores back only after it commits, holding nothing else, by `[concurrency_key, id]` as a dispatch takes them, so it can't wait on another claim or a dispatch in a cycle through semaphores. Discard goes by job id, as in Solid Queue, so it can deadlock with a claim or a dispatch that holds several keys, as it already can with a dispatch.
 
-On MySQL, gap locks add a cycle that rows alone don't show. A claim holds ready rows and waits for semaphore K, while the dispatcher holds K and inserts a ready row next to the claim's. The claim's first-pass retry and the dispatcher's batch retry cover it. Blocked maintenance and job finish run outside both retries, as they do in Solid Queue today.
+Releasing inside the claim was tried first, and deadlocked on MySQL under load. A claim holding a state row woke a blocked job, inserting a ready row next to ready rows another claim had locked, and that claim was waiting for the state row. A claim that updated a semaphore while holding ready rows could also deadlock with anything that takes a semaphore and then inserts a ready row: the dispatcher, a job finishing, or maintenance. Solid Queue's own claims never touch semaphores, and after the commit the gem's don't either.
 
 `lock_all` reads which keys exist before it inserts the missing ones. On PostgreSQL, an insert that skips a duplicate still takes a value from the id sequence, and reading first keeps that off the hot path. MySQL doesn't support `insert_all` with `unique_by`, so the insert relies on the unique index to skip a key that another claim inserted in the meantime.
 
@@ -199,7 +201,7 @@ The lock order rules out cycles on the state rows, except for a row `lock_all` i
 
 Each refill pass rescues `ActiveRecord::Deadlocked`. A deadlock on the first pass rolls it back, and the pass runs once more. With `key:`, claims insert new budgets' rows often, and on MySQL two claims inserting the same row can deadlock. Solid Queue's poller doesn't rescue errors, so raising would stop the worker until the supervisor replaces it. A second deadlock on the first pass raises. A deadlock on a later pass rolls back only that pass, and the claim returns what earlier passes committed.
 
-A claim that gives a deferred job's semaphore back can deadlock with the dispatcher on MySQL too. See [Lock order](#lock-order). The same retries cover it.
+A claim gives deferred jobs' semaphores back after it commits, so that adds no deadlock to the claim. See [Lock order](#lock-order).
 
 A claim that defers jobs inserts scheduled executions while it holds ready ones, and the dispatcher inserts ready executions while it holds scheduled ones. On MySQL the two take gap locks in opposite orders and can deadlock, which the concurrency test shows under load. The dispatcher's poll doesn't rescue errors either, so `dispatch_next_batch` rescues `ActiveRecord::Deadlocked` and runs the batch once more, and a second deadlock raises. Inside an outer transaction neither retries, because a deadlock aborts the whole transaction.
 
@@ -238,9 +240,9 @@ A class that raises `StandardError` or `ScriptError` when its name is constantiz
 
 A class can declare both `limits_rate` and `limits_concurrency`, in either order and through inheritance. Solid Queue takes a job's semaphore when it dispatches the job, so a ready job already holds it when a worker claims it. A job the rate admits keeps its semaphore and is claimed as Solid Queue would claim it. A job the rate rejects gives its semaphore back before it waits.
 
-After the rejected jobs are inserted as scheduled executions, `release_concurrency_locks` loads the ones that have a concurrency key, sorts them by `[concurrency_key, id]` and does what Solid Queue's `Job#unblock_next_blocked_job` does for each: it signals the semaphore the job holds, through the private `release_concurrency_lock`, and runs `BlockedExecution.release_one` for its key. That's what `ReadyExecution.discard_jobs` does. The gem calls the two parts itself, rather than `unblock_next_blocked_job`, so a wake that fails can be rolled back without the release. The sort is the one `dispatch_all_one_by_one` uses. `Job.unblock_next_blocked_jobs` isn't used, because its `find_each` goes by id. Rate rows are locked and charged first, because only rejected jobs release a semaphore.
+After the rejected jobs are inserted as scheduled executions, the claim loads the ones that have a concurrency key and sorts them by `[concurrency_key, id]`, the order `dispatch_all_one_by_one` uses. Once the pass commits, `release_concurrency_locks` calls Solid Queue's `Job#unblock_next_blocked_job` on each, which signals the semaphore the job holds and runs `BlockedExecution.release_one` for its key, as `ReadyExecution.discard_jobs` does. `Job.unblock_next_blocked_jobs` isn't used, because its `find_each` goes by id. The jobs are loaded inside the claim, so each releases the semaphore it held when it was deferred, even if the dispatcher has brought it back and it took another in the meantime. Rate rows are locked and charged first, because only rejected jobs release a semaphore.
 
-The release, the wake and the deferral commit or roll back together, so a crash can't leave a free semaphore while blocked jobs wait for maintenance. Solid Queue's own finish path, which wakes after its transaction, does have that window.
+The release and the wake run after each pass commits, as Solid Queue's `ClaimedExecution#finalize` unblocks after its transaction, and before the claim looks again, so the next pass can claim a job it woke. A process that crashes between the commit and the release leaves the deferred job's semaphore taken until it expires and maintenance deletes it, as a crash after a job finishes does in Solid Queue. Inside an outer transaction the claim looks once, and the release runs at the end of it, in that transaction.
 
 When the dispatcher brings the job back, Solid Queue's `Job#dispatch` takes a semaphore again, or blocks the job if there's none free. The gem doesn't change that.
 
@@ -250,7 +252,7 @@ Holding the semaphore while the job waits was rejected. A backlog can defer a jo
 
 ### Exactly once
 
-Only the claim that locked a ready row can release that row's semaphore, because it deletes the row in the same transaction. Every other path that signals a semaphore, `before_destroy` on a ready job, `ClaimedExecution#finalize` and `ReadyExecution.discard_jobs`, needs a ready or claimed row. Only a new dispatch creates one, and a new dispatch takes the semaphore again and records it. A scheduled or blocked job never signals, so discarding a deferred job, or one that came back and was blocked, leaves the semaphore alone.
+Only the claim that locked a ready row can release that row's semaphore, because it deletes the row in the same transaction, and it releases it once, after the commit. Every other path that signals a semaphore, `before_destroy` on a ready job, `ClaimedExecution#finalize` and `ReadyExecution.discard_jobs`, needs a ready or claimed row. Only a new dispatch creates one, and a new dispatch takes the semaphore again and records it. A scheduled or blocked job never signals, so discarding a deferred job, or one that came back and was blocked, leaves the semaphore alone.
 
 Solid Queue 1.7.2 records the semaphore a job holds in `"solid_queue_concurrency_lock"`, and the release relies on it. A job that recorded no semaphore, because its class didn't load when it was dispatched, gives none back. A job whose semaphore expired and was replaced leaves the new one alone. The record stays on a released job, which saves a write to `jobs.arguments` for each deferral, and the next dispatch overwrites it.
 
@@ -260,7 +262,7 @@ Solid Queue 1.7.2 records the semaphore a job holds in `"solid_queue_concurrency
 
 ### Wakes that fail
 
-Each wake runs in a savepoint, after the release and outside it. A `ScriptError`, or an error that isn't an Active Record error, raised while loading the woken job's class is logged, and that job stays blocked for maintenance, so one broken class can't stop a claim. The savepoint rolls back only the wake, so the deferred job's semaphore is still given back, and the next job dispatched with its key can take it. A woken job whose class is missing is failed by Solid Queue's `BlockedExecution#release`, which doesn't raise, and the next blocked job waits for maintenance, as it does in Solid Queue. Active Record errors, `ActiveRecord::Deadlocked` included, reach the claim's retry.
+The release is a statement of its own and the wake a transaction of its own, so a wake that fails doesn't take the release back, and the next job dispatched with the key can take the semaphore. The claim has committed by then, so an error, a deadlock or a `ScriptError` from loading the woken job's class included, is logged, and the claim returns what it claimed. The woken job stays blocked for maintenance. Inside an outer transaction, an Active Record error is raised instead, because the transaction can't go on. A woken job whose class is missing is failed by Solid Queue's `BlockedExecution#release`, which doesn't raise, and the next blocked job waits for maintenance, as it does in Solid Queue.
 
 A wake calls `release_one` once, as Solid Queue's finish path does. Neither looks past a failed job at the head of the blocked queue.
 
@@ -305,7 +307,7 @@ A dispatcher poll also makes about `to × polling_interval / per` jobs due at on
 | Declaring `limits_rate`, and refusing `on_conflict: :discard` with it | `lib/active_job/rate_controls.rb` | `limits_rate`, `rate_limited?`, `rate_limit_keyed?`, `rate_limit_interval`, `limits_concurrency`, `ensure_rate_limit_compatible_with_concurrency_controls` |
 | Building and storing a job's key | `lib/active_job/rate_controls.rb` | `serialize`, `deserialize`, `rate_limit_key`, `RATE_LIMIT_KEY` |
 | Admission, deferral and scheduling | `app/models/solid_queue/ready_execution/rate_limited.rb` | `defer_rate_limited`, `rate_limit_keys`, `check_rate_limits`, `schedule_rate_limited`, `rate_limited_job_class` |
-| Giving a deferred job's semaphore back and waking a blocked job | `app/models/solid_queue/ready_execution/rate_limited.rb` | `release_concurrency_locks` |
+| Giving a deferred job's semaphore back and waking a blocked job | `app/models/solid_queue/ready_execution/rate_limited.rb`, `lib/solid_queue/rate_limit/patches.rb` | `hold_concurrency_locks`, `release_concurrency_locks`, `select_and_lock` |
 | GCRA and slots | `app/models/solid_queue/rate_limit_state.rb` | `lock_all`, `admit`, `defer`, `MAX_DEFERRAL`, `PendingMigrations` |
 | Clearing idle budgets | `app/models/solid_queue/rate_limit_state.rb` | `clear_idle_in_batches`, `idle`, `lock_one` |
 | Every place the gem reaches into Solid Queue | `lib/solid_queue/rate_limit/patches.rb` | `Claiming`, `Dispatching`, `Enqueuing`, `MAX_CLAIM_PASSES`, the log subscriber |

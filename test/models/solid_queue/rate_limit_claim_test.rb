@@ -168,19 +168,39 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     ActiveSupport::Notifications.unsubscribe(subscriber)
   end
 
-  test "a deadlock while waking a blocked job rolls the look back, and it looks once more" do
+  test "a deferred job gives its semaphore back and wakes the next blocked job once the claim has committed" do
     spend_budget_of("a")
-    deferred = SyncAccountJob.perform_later("a")
-    woken = SyncAccountJob.perform_later("b")
+    SyncAccountJob.perform_later("a")
+    SyncAccountJob.perform_later("b")
+    statements = []
+    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") { |*, payload| statements << payload[:sql] }
 
-    claimed = deadlocking_on("SolidQueue::ReadyExecution Create", occurrence: 1) { claim(10) }
+    claim(10)
 
-    assert_equal [ woken.provider_job_id ], claimed.map(&:job_id)
-    assert_equal [ deferred.provider_job_id ], SolidQueue::ScheduledExecution.pluck(:job_id)
-    assert_equal 0, SolidQueue::Semaphore.sole.value
+    assert_operator statements.index { |sql| sql.match?(/\AUPDATE .solid_queue_semaphores. SET value = value \+ 1/) }, :>, statements.index { |sql| sql.match?(/\ACOMMIT/i) }
+  ensure
+    ActiveSupport::Notifications.unsubscribe(subscriber)
   end
 
-  test "rolling back a claim undoes the release, the wake and the deferral together" do
+  test "a deadlock while waking a blocked job is logged, and the claim keeps what it deferred and gives the semaphore back" do
+    spend_budget_of("a")
+    deferred = SyncAccountJob.perform_later("a")
+    blocked = SyncAccountJob.perform_later("b")
+    unlimited = UnlimitedJob.perform_later("behind them")
+    log = StringIO.new
+
+    claimed = SolidQueue.with(logger: ActiveSupport::Logger.new(log)) do
+      deadlocking_on("SolidQueue::ReadyExecution Create", occurrence: 1) { claim(10) }
+    end
+
+    assert_equal [ unlimited.provider_job_id ], claimed.map(&:job_id)
+    assert_equal [ deferred.provider_job_id ], SolidQueue::ScheduledExecution.pluck(:job_id)
+    assert_equal [ blocked.provider_job_id ], SolidQueue::BlockedExecution.pluck(:job_id)
+    assert_equal 1, SolidQueue::Semaphore.sole.value
+    assert_match(/ActiveRecord::Deadlocked/, log.string)
+  end
+
+  test "inside a transaction, rolling it back undoes the release, the wake and the deferral together" do
     spend_budget_of("a")
     deferred = SyncAccountJob.perform_later("a")
     woken = SyncAccountJob.perform_later("b")
