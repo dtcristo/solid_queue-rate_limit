@@ -19,6 +19,8 @@ end
 
 The limit is checked when a worker claims the job, inside Solid Queue's own claim transaction, so it holds across any number of workers and processes on SQLite, PostgreSQL and MySQL. Unlimited jobs in the same queue keep running while limited ones wait.
 
+To collapse repeated calls into one job before the limit sees them, pair it with [Solid Queue Coalesce](https://github.com/dtcristo/solid_queue-coalesce). The [last two recipes](#batch-calls-under-a-quota) use both.
+
 ## Table of contents
 
 - [Getting started](#getting-started)
@@ -85,6 +87,8 @@ Start from what the API on the other end allows.
 - [One quota for several job classes](#share-a-budget-between-classes)
 - [A quota for each account, used by several job classes](#share-a-budget-for-each-account-between-classes)
 - [One job at a time for each account, under one quota](#run-one-job-at-a-time-for-each-account-under-a-global-rate)
+- [A bulk API, with calls batched while they wait](#batch-calls-under-a-quota)
+- [One pending and one running job for each account, under one quota](#collapse-calls-for-each-account-and-run-them-one-at-a-time-under-a-global-rate)
 
 `Account`, `Address`, `Shop`, `Webhook` and the other names in these recipes stand in for your own code.
 
@@ -232,6 +236,54 @@ end
 
 Solid Queue gives each account one concurrency slot, and the gem checks the rate when a worker claims the job. A job over the rate gives its concurrency slot back while it waits, so the account's next blocked job can take it, and takes one again when it comes back. If there's none free by then, the job is blocked, as any job would be. `limits_concurrency` with `on_conflict: :discard` can't be combined with `limits_rate`, because a job that came back to a taken concurrency slot would be discarded.
 
+### Batch calls under a quota
+
+Use this when an API has a bulk endpoint with a quota on requests, and calls arrive one item at a time. It needs [Solid Queue Coalesce](https://github.com/dtcristo/solid_queue-coalesce).
+
+```ruby
+class PushInventoryJob < ApplicationJob
+  # Up to 100 SKUs in each request, and at most 2 + 8 requests in any minute for each shop
+  coalesce key: ->(shop, _sku) { shop }, on_conflict: :collect, max_calls: 100
+  limits_rate to: 8, per: 1.minute, burst: 2, key: ->(shop, _sku) { shop }
+
+  def perform_calls(calls)
+    shop = calls.first.arguments.first
+    shop.push_inventory(calls.map { |call| call.arguments.last }.uniq)
+  end
+end
+```
+
+Each call joins the shop's pending job until it holds 100, and the limit is checked when a worker claims that job. A job waiting on the rate hasn't started, so calls keep joining it, and batches grow as the budget runs out. The limit counts claims, so make one bulk request in each run. A retry runs all of the job's calls again, and is charged again.
+
+### Collapse calls for each account and run them one at a time, under a global rate
+
+Use this when an account's sync can be asked for many times, only the latest needs to run, two syncs for one account mustn't overlap, and all accounts together have to stay under an API's quota. It needs [Solid Queue Coalesce](https://github.com/dtcristo/solid_queue-coalesce).
+
+```ruby
+class SyncShopProductsJob < ApplicationJob
+  # One pending and one running sync for each shop, and at most 3 + 2 claims in any second across them
+  coalesce key: ->(shop) { shop }
+  limits_concurrency key: ->(shop) { shop }
+  limits_rate to: 2, per: 1.second, burst: 3, group: "Shopify"
+
+  def perform(shop)
+    shop.sync_products!
+  end
+end
+```
+
+Each control acts at a different step of the job's life:
+
+| Step | What happens | Control |
+| --- | --- | --- |
+| `perform_later` | The call joins the shop's pending job, or creates one. The job stores the concurrency and rate limit keys of the call that created it | `coalesce` |
+| The job becomes ready | It takes the shop's concurrency slot, or is blocked until the running sync finishes | `limits_concurrency` |
+| A worker claims it | The budget admits it, or it waits as a scheduled job and gives its concurrency slot back | `limits_rate` |
+| `perform` starts | The coalesce key is free, so the next call creates the next pending job | `coalesce` |
+| `perform` finishes | The concurrency slot is free, and the shop's blocked job becomes ready | `limits_concurrency` |
+
+A job waiting on the rate still holds its coalesce key, so calls keep joining it. With `debounce:`, a call can move it later than its rate check, but never earlier. With `on_full: :dispatch`, a full job that's waiting becomes ready, and the next claim sends it back to wait.
+
 ## How waiting works
 
 When a worker claims jobs, the gem checks each limited job against its budget, in queue order, inside Solid Queue's claim transaction. A job the budget admits is claimed and runs like any other. A job over the limit moves from `solid_queue_ready_executions` to `solid_queue_scheduled_executions`, with a time to check again. It doesn't take a worker thread, and Active Job doesn't see a retry. When that time comes, the dispatcher makes it ready as usual, and the next claim checks it again.
@@ -286,6 +338,7 @@ These numbers come from 30 to 60 waiting jobs, with one worker polling every 0.1
 ## Things to know
 
 - It's a separate gem that adds to Solid Queue from the outside, with its own table. It only works with the Solid Queue adapter, because it checks the limit inside Solid Queue's claim.
+- It works with [Solid Queue Coalesce](https://github.com/dtcristo/solid_queue-coalesce), which coalesces calls when they're enqueued, before the limit checks the job at claim. See [Batch calls under a quota](#batch-calls-under-a-quota).
 - The limit counts claims, not API calls, and isn't an exact rolling-window quota once `burst` is above 1. See [What the limit guarantees](#what-the-limit-guarantees).
 - With `burst: 1`, a backlog drains slower than the rate. See [Picking a burst for a backlog](#picking-a-burst-for-a-backlog).
 - A waiting job is a scheduled job with its own `scheduled_at` kept, and checks again at most 5 minutes later. See [How waiting works](#how-waiting-works).
@@ -312,6 +365,7 @@ It takes `batch_size:`, 500 by default, and `sleep_between_batches:`, like Solid
 | Rails | 7.1, 7.2, 8.0 and 8.1. CI also runs Rails main, except on Ruby 3.2 |
 | Solid Queue | 1.7.2 and newer within 1.7 |
 | Database | MySQL, PostgreSQL and SQLite |
+| [Solid Queue Coalesce](https://github.com/dtcristo/solid_queue-coalesce) | Optional. CI tests 0.2 alongside |
 
 CI runs Ruby 3.2, 3.3, 3.4 and 4.0 against all three databases.
 
