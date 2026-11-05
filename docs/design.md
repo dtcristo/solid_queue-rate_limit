@@ -307,7 +307,7 @@ A dispatcher poll also makes about `to × polling_interval / per` jobs due at on
 | Declaring `limits_rate`, and refusing `on_conflict: :discard` with it | `lib/active_job/rate_controls.rb` | `limits_rate`, `rate_limited?`, `rate_limit_keyed?`, `rate_limit_interval`, `limits_concurrency`, `ensure_rate_limit_compatible_with_concurrency_controls` |
 | Building and storing a job's key | `lib/active_job/rate_controls.rb` | `serialize`, `deserialize`, `rate_limit_key`, `RATE_LIMIT_KEY` |
 | Admission, deferral and scheduling | `app/models/solid_queue/ready_execution/rate_limited.rb` | `defer_rate_limited`, `rate_limit_keys`, `check_rate_limits`, `schedule_rate_limited`, `rate_limited_job_class` |
-| Giving a deferred job's semaphore back and waking a blocked job | `app/models/solid_queue/ready_execution/rate_limited.rb`, `lib/solid_queue/rate_limit/patches.rb` | `hold_concurrency_locks`, `release_concurrency_locks`, `select_and_lock` |
+| Giving a deferred job's semaphore back and waking a blocked job | `app/models/solid_queue/ready_execution/rate_limited.rb`, `lib/solid_queue/rate_limit/patches.rb` | `hold_concurrency_locks`, `release_concurrency_locks`, `releasing_concurrency_locks` |
 | GCRA and slots | `app/models/solid_queue/rate_limit_state.rb` | `lock_all`, `admit`, `defer`, `MAX_DEFERRAL`, `PendingMigrations` |
 | Clearing idle budgets | `app/models/solid_queue/rate_limit_state.rb` | `clear_idle_in_batches`, `idle`, `lock_one` |
 | Every place the gem reaches into Solid Queue | `lib/solid_queue/rate_limit/patches.rb` | `Claiming`, `Dispatching`, `Enqueuing`, `MAX_CLAIM_PASSES`, the log subscriber |

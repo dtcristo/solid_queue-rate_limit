@@ -168,16 +168,36 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     ActiveSupport::Notifications.unsubscribe(subscriber)
   end
 
-  test "a deferred job gives its semaphore back and wakes the next blocked job once the claim has committed" do
+  test "a deferred job wakes the next blocked job once its deferral has committed" do
     spend_budget_of("a")
-    SyncAccountJob.perform_later("a")
+    deferred = SyncAccountJob.perform_later("a")
     SyncAccountJob.perform_later("b")
-    statements = []
-    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") { |*, payload| statements << payload[:sql] }
+    committed = []
+    subscriber = ActiveSupport::Notifications.subscribe("release_blocked.solid_queue") do
+      committed << Thread.new { SolidQueue::Record.connection_pool.with_connection { SolidQueue::ScheduledExecution.exists?(job_id: deferred.provider_job_id) } }.value
+    end
 
     claim(10)
 
-    assert_operator statements.index { |sql| sql.match?(/\AUPDATE .solid_queue_semaphores. SET value = value \+ 1/) }, :>, statements.index { |sql| sql.match?(/\ACOMMIT/i) }
+    assert_equal [ true ], committed
+  ensure
+    ActiveSupport::Notifications.unsubscribe(subscriber)
+  end
+
+  test "a claim that fails after deferring gives no semaphore back, then or on its next claim" do
+    spend_budget_of("a")
+    deferred = SyncAccountJob.perform_later("a")
+    blocked = SyncAccountJob.perform_later("b")
+    failing = ->(*, payload) { raise ActiveRecord::StatementInvalid, "failed" if payload[:name] == "SolidQueue::ReadyExecution Delete All" }
+
+    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record", failing)
+    assert_raises(ActiveRecord::StatementInvalid) { claim(10) }
+    ActiveSupport::Notifications.unsubscribe(subscriber)
+    claim(0)
+
+    assert_equal [ deferred.provider_job_id ], SolidQueue::ReadyExecution.pluck(:job_id)
+    assert_equal [ blocked.provider_job_id ], SolidQueue::BlockedExecution.pluck(:job_id)
+    assert_equal 0, SolidQueue::Semaphore.sole.value
   ensure
     ActiveSupport::Notifications.unsubscribe(subscriber)
   end

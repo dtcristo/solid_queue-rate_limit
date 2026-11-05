@@ -19,17 +19,16 @@ module SolidQueue
         private
           def select_and_lock(queue_relation, process_id, limit)
             return super unless RateLimit.enforced?
-            return super.tap { release_concurrency_locks } if connection_pool.with_connection(&:transaction_open?)
+            return releasing_concurrency_locks { super } if connection_pool.with_connection(&:transaction_open?)
 
             claimed = []
             retried = false
 
             MAX_CLAIM_PASSES.times do |pass|
               begin
-                claimed += super(queue_relation, process_id, limit - claimed.size)
+                # Before looking again, so the jobs it wakes can be claimed
+                claimed += releasing_concurrency_locks { super(queue_relation, process_id, limit - claimed.size) }
               rescue ActiveRecord::Deadlocked
-                ActiveSupport::IsolatedExecutionState.delete(:solid_queue_rate_limit_releases)
-
                 # Whatever earlier passes claimed has been committed
                 break if pass.positive?
                 raise if retried
@@ -38,8 +37,6 @@ module SolidQueue
                 retry
               end
 
-              # Before looking again, so the jobs it wakes can be claimed
-              release_concurrency_locks
               break unless claimed.size < limit && rate_limit_deferred_in_pass?
             end
 
@@ -48,7 +45,6 @@ module SolidQueue
 
           def lock_candidates(executions, process_id)
             ActiveSupport::IsolatedExecutionState[:solid_queue_rate_limit_deferred] = false
-            ActiveSupport::IsolatedExecutionState.delete(:solid_queue_rate_limit_releases)
             return super unless RateLimit.enforced? && executions.any?
 
             deferred = defer_rate_limited(executions)
@@ -59,6 +55,14 @@ module SolidQueue
             super(executions - deferred, process_id).tap do
               where(id: deferred.map(&:id)).delete_all
             end
+          end
+
+          # Gives back the semaphores of the jobs a pass deferred once it has committed. A pass
+          # that fails has rolled them back, so they're forgotten rather than left for the next.
+          def releasing_concurrency_locks
+            yield.tap { release_concurrency_locks }
+          ensure
+            ActiveSupport::IsolatedExecutionState.delete(:solid_queue_rate_limit_releases)
           end
 
           def rate_limit_deferred_in_pass?
