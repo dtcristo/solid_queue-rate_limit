@@ -80,7 +80,14 @@ module SolidQueue
           # claims that release the same semaphores take them in the same order.
           def release_concurrency_locks(job_ids)
             if job_ids.any?
-              Job.where(id: job_ids).sort_by { |job| [ job.concurrency_key, job.id ] }.each(&:unblock_next_blocked_job)
+              Job.where(id: job_ids).sort_by { |job| [ job.concurrency_key, job.id ] }.each do |job|
+                transaction(requires_new: true) { job.unblock_next_blocked_job }
+              rescue ActiveRecord::ActiveRecordError
+                raise
+              rescue StandardError, ScriptError => error
+                # A blocked job whose class can't be loaded stays blocked, rather than failing the claim
+                SolidQueue.logger&.error("Couldn't release the next job blocked on #{job.concurrency_key}: #{error.class}: #{error.message}")
+              end
             end
           end
 
