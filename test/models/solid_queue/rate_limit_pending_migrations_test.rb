@@ -14,6 +14,20 @@ class SolidQueue::RateLimitPendingMigrationsTest < ActiveSupport::TestCase
     end
   end
 
+  class CoalescedLimitedJob < ApplicationJob
+    coalesce key: ->(value) { value }
+    limits_rate to: 1, per: 1.minute
+
+    def perform(value); end
+  end
+
+  class CollectingLimitedJob < ApplicationJob
+    coalesce key: ->(value) { value }, on_conflict: :collect
+    limits_rate to: 1, per: 1.minute
+
+    def perform_calls(calls); end
+  end
+
   # Recreate an app that hasn't run the optional migration by reverting the
   # actual migration that ships with the install generator.
   setup do
@@ -34,6 +48,16 @@ class SolidQueue::RateLimitPendingMigrationsTest < ActiveSupport::TestCase
     assert_match(/solid_queue:rate_limit:install/, error.message)
 
     assert_raises(SolidQueue::RateLimitState::PendingMigrations) { ActiveJob.perform_all_later([ AddToBufferJob.new("b"), LimitedJob.new("c") ]) }
+    assert_equal 0, SolidQueue::Job.count
+  end
+
+  test "enqueueing a coalesced limited job raises the same error, single or bulk" do
+    [ CoalescedLimitedJob, CollectingLimitedJob ].each do |job_class|
+      assert_raises(SolidQueue::RateLimitState::PendingMigrations) { job_class.perform_later("a") }
+      assert_raises(SolidQueue::RateLimitState::PendingMigrations) { ActiveJob.perform_all_later([ job_class.new("b") ]) }
+      assert_raises(SolidQueue::RateLimitState::PendingMigrations) { ActiveJob.perform_all_later([ AddToBufferJob.new("c"), job_class.new("d") ]) }
+    end
+
     assert_equal 0, SolidQueue::Job.count
   end
 

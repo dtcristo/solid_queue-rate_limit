@@ -228,7 +228,7 @@ Without eager loading, a class may not load until its job is claimed, so the gem
 
 ## Missing migration
 
-`SolidQueue::Job.enqueue` and `enqueue_all` raise `RateLimitState::PendingMigrations` for a limited class while the table is missing. They're prepended on the model rather than the adapter, because `RecurringTask` calls `Job.enqueue` directly. It's best effort. A gem that enqueues through its own path, such as solid_queue-coalesce's coalesced enqueues, can skip it.
+`serialize` raises `RateLimitState::PendingMigrations` for a limited class on the Solid Queue adapter while the table is missing. Every path into `solid_queue_jobs` serializes the job before it writes, including `RecurringTask`, which calls `Job.enqueue` directly, and solid_queue-coalesce's coalesced enqueues, which don't call `super`. A patch on `Job.enqueue` would depend on which gem prepended last. In a bulk enqueue, Solid Queue and solid_queue-coalesce both serialize every job before inserting any, so nothing is written.
 
 A claim fails closed. Limited jobs that reach a worker without the table get scheduled a minute out, without any state, and each process logs one error. `migrated?` remembers only a true answer, but Active Record's schema cache remembers a missing table too, so a process has to restart to see the table.
 
