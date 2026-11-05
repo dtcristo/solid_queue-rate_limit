@@ -19,10 +19,23 @@ module SolidQueue
       end
     end
 
+    # A full budget with no slots ahead admits as a missing row does, so it can go
+    scope :idle, ->(now = Time.current) { where(tat: ...now, deferred_until: [ nil, ...now ]) }
+
     class << self
       # Until the app has run the gem's migration everything else works as before.
       def migrated?
         @migrated ||= table_exists?
+      end
+
+      # The delete checks each row again, because a claim can charge it once it's been
+      # picked. By key, so on MySQL it locks rows in the order claims do.
+      def clear_idle_in_batches(batch_size: 500, sleep_between_batches: 0)
+        loop do
+          records_deleted = idle.where(key: idle.limit(batch_size).pluck(:key)).delete_all
+          sleep(sleep_between_batches) if sleep_between_batches > 0
+          break if records_deleted == 0
+        end
       end
 
       # Returns the state of each key, by key, locked until the claim commits. A new
@@ -32,16 +45,27 @@ module SolidQueue
         keys = keys.sort
 
         # On PostgreSQL even a skipped insert takes a value from the id sequence
-        if (missing = keys - where(key: keys).pluck(:key)).any?
-          insert_all(missing.map { |key| { key: key, tat: Time.current } })
-        end
-
+        insert_missing(keys - where(key: keys).pluck(:key))
         states = where(key: keys).order(:key).lock.index_by(&:key)
 
-        # Under a case-insensitive collation, like MySQL's default, a key can match
-        # a row spelled differently, and then the two share a budget
-        keys.index_with { |key| states[key] || states.fetch(where(key: key).pick(:key)) }
+        keys.index_with { |key| states[key] || lock_one(key, states) }
       end
+
+      private
+        def insert_missing(keys)
+          insert_all(keys.map { |key| { key: key, tat: Time.current } }) if keys.any?
+        end
+
+        # Under a case-insensitive collation, like MySQL's default, a key can match
+        # a row spelled differently, and then the two share a budget. A row the cleanup
+        # deleted since the check is inserted again, out of key order.
+        def lock_one(key, states)
+          until (state = where(key: key).lock.first)
+            insert_missing([ key ])
+          end
+
+          states[state.key] ||= state
+        end
     end
 
     # Charges one admission and returns true, or returns false if the budget is spent.

@@ -81,7 +81,7 @@ create_table :solid_queue_rate_limits do |t|
 end
 ```
 
-One row per budget, made the first time a claim needs it. There are no foreign keys, and Solid Queue's tables don't change. `key` uses the database's default collation, like Solid Queue's semaphores. Under MySQL's case-insensitive default, two keys that differ only in case find the same row and share a budget. `lock_all` maps each key to the row it matched, so it doesn't fail on the spelling difference.
+One row per budget, made the first time a claim needs it, and deleted by `clear_idle_in_batches` once it's idle. See [Clearing idle budgets](#clearing-idle-budgets). There are no foreign keys, and Solid Queue's tables don't change. `key` uses the database's default collation, like Solid Queue's semaphores. Under MySQL's case-insensitive default, two keys that differ only in case find the same row and share a budget. `lock_all` maps each key to the row it matched, so it doesn't fail on the spelling difference.
 
 ## A claim pass
 
@@ -173,9 +173,24 @@ Inside an outer transaction, the gem runs a single pass, with admission but with
 
 ## Deadlocks
 
-The lock order rules out cycles on the state rows. InnoDB can still deadlock through gap locks, for example when two claims insert neighbouring missing keys.
+The lock order rules out cycles on the state rows, except for a row `lock_all` inserts again after the cleanup deleted it. See [Clearing idle budgets](#clearing-idle-budgets). InnoDB can still deadlock through gap locks, for example when two claims insert neighbouring missing keys.
 
 Each refill pass rescues `ActiveRecord::Deadlocked`. A deadlock on the first pass rolls it back, and the pass runs once more. With `key:`, claims insert new budgets' rows often, and on MySQL two claims inserting the same row can deadlock. Solid Queue's poller doesn't rescue errors, so raising would stop the worker until the supervisor replaces it. A second deadlock on the first pass raises. A deadlock on a later pass rolls back only that pass, and the claim returns what earlier passes committed.
+
+## Clearing idle budgets
+
+`SolidQueue::RateLimitState.clear_idle_in_batches(batch_size: 500, sleep_between_batches: 0)` has the shape of Solid Queue's `clear_finished_in_batches`. It deletes up to `batch_size` idle rows at a time until a batch deletes none. Nothing calls it. The README suggests a recurring task.
+
+A row is idle when `tat` is in the past and `deferred_until` is null or in the past. Such a row behaves as a missing one does, under any settings:
+
+- A missing row is inserted with `tat` at the time of the insert, which is before the claim reads the time. Both rows then have `tat <= now`, so the clamp changes nothing and an admission sets `tat` to `now + T` either way.
+- A rejection on either row comes after a full budget's `burst` admissions, so `tat - τ` is `now + T`. The idle row's `deferred_until + T` is below `now + T`, so the slot is `now + T` for both.
+
+A row with `tat` in the past but slots ahead is kept. Deleting it would hand those slots out again, and waiting jobs would bunch up. Whether a row is idle is decided by the cleanup's clock. A worker whose clock is behind it by `s` could find `tat` up to `s` ahead, so a deleted row can admit up to `s` sooner. That's the clock skew the README already asks you to avoid.
+
+Each batch reads idle keys, then deletes them with the idle condition repeated in the `DELETE`. A claim that charges a row in between moves its `tat` past now, so the `DELETE` skips it. On PostgreSQL and MySQL, a `DELETE` that waits for a claim's lock checks the row's committed version once the claim commits. A single `DELETE` with a `LIMIT` subquery, which is what Active Record builds on PostgreSQL and SQLite, would only check the subquery's rows as they were. The delete matches by key, so on MySQL it locks rows through the key index, in key order, as claims do.
+
+The cleanup races claims the other way too. `lock_all` reads which keys exist without locking, and the cleanup can delete a row after that read, so the locking read misses it. `lock_all` then locks that key alone and inserts it again if it's gone, which is also how it finds a row spelled differently under a case-insensitive collation. That lock is taken out of key order, so it can deadlock with another claim. It only happens when the cleanup deletes a row in the moment between a claim's two reads, and the deadlock is handled as any other. See [Deadlocks](#deadlocks). Claims where every row exists run the same queries as in 0.1.0.
 
 ## Fast path
 
@@ -229,6 +244,7 @@ A dispatcher poll also makes about `to × polling_interval / per` jobs due at on
 - Capped staggering on a large, slow backlog isn't stress-tested. With 10,000 jobs at 1 per minute, 5 jobs hold slots and the rest come back every 5 minutes, about 33 dispatches and deferrals a second for nothing.
 - On Rails 7.x, SQLite transactions are DEFERRED, so a claim starts as a reader and upgrades to a writer. The dummy app opens IMMEDIATE transactions on every Rails version, so the suite has never run claims on Rails 7.x's default.
 - On MySQL, a claim's scheduled inserts and the dispatcher's ready inserts could take gap locks that deadlock each other. Testing hasn't shown it. A deadlock on a claim's first pass runs the pass once more, and a second one raises.
+- On PostgreSQL, the cleanup's `DELETE` locks rows in scan order, not key order, so it can deadlock with a claim that holds several keys. One of them is rolled back, and the cleanup runs again at its next schedule. Testing hasn't shown it.
 - With `burst: 1`, a backlog drains at about half to nine tenths of the rate. See [Throughput with a small burst](#throughput-with-a-small-burst). [#6](https://github.com/dtcristo/solid_queue-rate_limit/issues/6) is the place to change that.
 
 ## Where it lives
@@ -239,6 +255,7 @@ A dispatcher poll also makes about `to × polling_interval / per` jobs due at on
 | Building and storing a job's key | `lib/active_job/rate_controls.rb` | `serialize`, `deserialize`, `rate_limit_key`, `RATE_LIMIT_KEY` |
 | Admission, deferral and scheduling | `app/models/solid_queue/ready_execution/rate_limited.rb` | `defer_rate_limited`, `rate_limit_keys`, `check_rate_limits`, `schedule_rate_limited`, `rate_limited_job_class` |
 | GCRA and slots | `app/models/solid_queue/rate_limit_state.rb` | `lock_all`, `admit`, `defer`, `MAX_DEFERRAL`, `PendingMigrations` |
+| Clearing idle budgets | `app/models/solid_queue/rate_limit_state.rb` | `clear_idle_in_batches`, `idle`, `lock_one` |
 | Every place the gem reaches into Solid Queue | `lib/solid_queue/rate_limit/patches.rb` | `Claiming`, `Enqueuing`, `MAX_CLAIM_PASSES`, the log subscriber |
 | The fast path | `lib/solid_queue/rate_limit.rb` | `declared`, `enforced?` |
 | Table | `lib/generators/solid_queue/rate_limit/install/templates/db/create_solid_queue_rate_limits.rb` | |

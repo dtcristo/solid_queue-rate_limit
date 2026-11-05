@@ -27,6 +27,7 @@ The limit is checked when a worker claims the job, inside Solid Queue's own clai
 - [What the limit guarantees](#what-the-limit-guarantees)
 - [Picking a burst for a backlog](#picking-a-burst-for-a-backlog)
 - [Things to know](#things-to-know)
+- [Clearing idle budgets](#clearing-idle-budgets)
 - [Compatibility](#compatibility)
 - [`limits_rate` options](#limits_rate-options)
 - [Rules and limitations](#rules-and-limitations)
@@ -271,6 +272,18 @@ These numbers come from 30 to 60 waiting jobs, with one worker polling every 0.1
 - A waiting job is a scheduled job with its own `scheduled_at` kept, and checks again at most 5 minutes later. See [How waiting works](#how-waiting-works).
 - Each job class has its own budget, and so does each subclass, unless it declares `key:` or `group:`. See [Rules and limitations](#rules-and-limitations).
 - When the app is eager-loaded and no class declares `limits_rate`, claims run exactly Solid Queue's queries. Otherwise each claim reads the class names of the jobs it locked, and locks one row per budget. When some of those jobs' classes declare `key:` or `group:`, it reads their keys too, in one more query.
+
+## Clearing idle budgets
+
+A budget gets a row in `solid_queue_rate_limits` the first time a claim needs it, and the row stays. With `key:`, that's a row for every account, shop or API key your jobs have used. `SolidQueue::RateLimitState.clear_idle_in_batches` deletes the rows of budgets that are full and have no slots handed out ahead. Such a row admits exactly as a missing one does, so clearing never changes what's admitted, and a claim that runs while it clears inserts the row again. Nothing runs it for you, so add it to your `recurring.yml`, as Solid Queue's installer does for finished jobs:
+
+```yml
+clear_solid_queue_rate_limits:
+  command: "SolidQueue::RateLimitState.clear_idle_in_batches(sleep_between_batches: 0.3)"
+  schedule: every hour at minute 27
+```
+
+It takes `batch_size:`, 500 by default, and `sleep_between_batches:`, like Solid Queue's `clear_finished_in_batches`.
 
 ## Compatibility
 
