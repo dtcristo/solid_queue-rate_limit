@@ -270,7 +270,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     3.times { |i| LimitedJob.perform_later(i) }
     SolidQueue::RateLimitState.create!(key: LimitedJob.name, tat: Time.current)
 
-    queries = capture_queries { claim(10) } - [ "SCHEMA" ]
+    queries = capture_queries { claim(10) }
 
     assert_equal [ "SolidQueue::Pause Pluck", "TRANSACTION", "SolidQueue::ReadyExecution Load", "SolidQueue::Job Load", "SolidQueue::RateLimitState Pluck", "SolidQueue::RateLimitState Load", "SolidQueue::RateLimitState Update", "SolidQueue::ScheduledExecution Insert", "SolidQueue::ClaimedExecution Bulk Insert", "SolidQueue::ClaimedExecution Load", "SolidQueue::ReadyExecution Delete All", "SolidQueue::ReadyExecution Delete All", "TRANSACTION", "TRANSACTION", "SolidQueue::ReadyExecution Load", "TRANSACTION" ], queries
   end
@@ -287,9 +287,10 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
       ActiveSupport::Notifications.unsubscribe(subscriber)
     end
 
+    # Schema queries depend on which test loaded a model's columns first
     def capture_queries(&block)
       queries = []
-      subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") { |event| queries << event.payload[:name] }
+      subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") { |event| queries << event.payload[:name] unless event.payload[:name] == "SCHEMA" }
       block.call
       queries
     ensure
