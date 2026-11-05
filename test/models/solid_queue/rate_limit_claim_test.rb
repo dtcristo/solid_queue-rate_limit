@@ -34,6 +34,16 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     end
   end
 
+  # One at a time, with a budget for each account
+  class SyncAccountJob < ApplicationJob
+    limits_concurrency key: ->(*) { "all" }
+    limits_rate to: 1, per: 10.seconds, key: ->(account) { account }
+
+    def perform(account)
+      JobBuffer.add(account)
+    end
+  end
+
   # Not a job, whatever it says about itself
   class NotAJob
     def self.rate_limited?
@@ -142,12 +152,236 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     assert_equal [ LimitedJob.name ], SolidQueue::RateLimitState.pluck(:key)
   end
 
-  test "a job that still has a concurrency key is admitted without a rate check" do
+  test "a job the rate rejects wakes the next blocked job, which the claim can admit" do
+    spend_budget_of("a")
+    deferred = SyncAccountJob.perform_later("a")
+    woken = SyncAccountJob.perform_later("b")
+    events = []
+    subscriber = ActiveSupport::Notifications.subscribe("release_blocked.solid_queue") { |event| events << event.payload.slice(:job_id, :released) }
+
+    assert_equal [ woken.provider_job_id ], claim(10).map(&:job_id)
+    assert_equal [ deferred.provider_job_id ], SolidQueue::ScheduledExecution.pluck(:job_id)
+    assert_equal 0, SolidQueue::Semaphore.sole.value
+    assert SolidQueue::BlockedExecution.none?
+    assert_equal [ { job_id: woken.provider_job_id, released: true } ], events
+  ensure
+    ActiveSupport::Notifications.unsubscribe(subscriber)
+  end
+
+  test "a deferred job wakes the next blocked job once its deferral has committed" do
+    spend_budget_of("a")
+    deferred = SyncAccountJob.perform_later("a")
+    SyncAccountJob.perform_later("b")
+    committed = []
+    subscriber = ActiveSupport::Notifications.subscribe("release_blocked.solid_queue") do
+      committed << Thread.new { SolidQueue::Record.connection_pool.with_connection { SolidQueue::ScheduledExecution.exists?(job_id: deferred.provider_job_id) } }.value
+    end
+
+    claim(10)
+
+    assert_equal [ true ], committed
+  ensure
+    ActiveSupport::Notifications.unsubscribe(subscriber)
+  end
+
+  test "a claim that fails after deferring gives no semaphore back, then or on its next claim" do
+    spend_budget_of("a")
+    deferred = SyncAccountJob.perform_later("a")
+    blocked = SyncAccountJob.perform_later("b")
+    failing = ->(*, payload) { raise ActiveRecord::StatementInvalid, "failed" if payload[:name] == "SolidQueue::ReadyExecution Delete All" }
+
+    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record", failing)
+    assert_raises(ActiveRecord::StatementInvalid) { claim(10) }
+    ActiveSupport::Notifications.unsubscribe(subscriber)
+    claim(0)
+
+    assert_equal [ deferred.provider_job_id ], SolidQueue::ReadyExecution.pluck(:job_id)
+    assert_equal [ blocked.provider_job_id ], SolidQueue::BlockedExecution.pluck(:job_id)
+    assert_equal 0, SolidQueue::Semaphore.sole.value
+  ensure
+    ActiveSupport::Notifications.unsubscribe(subscriber)
+  end
+
+  test "a deadlock while waking a blocked job is logged, and the claim keeps what it deferred and gives the semaphore back" do
+    spend_budget_of("a")
+    deferred = SyncAccountJob.perform_later("a")
+    blocked = SyncAccountJob.perform_later("b")
+    unlimited = UnlimitedJob.perform_later("behind them")
+    log = StringIO.new
+
+    claimed = SolidQueue.with(logger: ActiveSupport::Logger.new(log)) do
+      deadlocking_on("SolidQueue::ReadyExecution Create", occurrence: 1) { claim(10) }
+    end
+
+    assert_equal [ unlimited.provider_job_id ], claimed.map(&:job_id)
+    assert_equal [ deferred.provider_job_id ], SolidQueue::ScheduledExecution.pluck(:job_id)
+    assert_equal [ blocked.provider_job_id ], SolidQueue::BlockedExecution.pluck(:job_id)
+    assert_equal 1, SolidQueue::Semaphore.sole.value
+    assert_match(/ActiveRecord::Deadlocked/, log.string)
+  end
+
+  test "inside a transaction, rolling it back undoes the release, the wake and the deferral together" do
+    spend_budget_of("a")
+    deferred = SyncAccountJob.perform_later("a")
+    woken = SyncAccountJob.perform_later("b")
+
+    SolidQueue::ReadyExecution.transaction do
+      claim(10)
+      assert_equal [ woken.provider_job_id ], SolidQueue::ReadyExecution.pluck(:job_id)
+      raise ActiveRecord::Rollback
+    end
+
+    assert_equal [ deferred.provider_job_id ], SolidQueue::ReadyExecution.pluck(:job_id)
+    assert_equal [ woken.provider_job_id ], SolidQueue::BlockedExecution.pluck(:job_id)
+    assert SolidQueue::ScheduledExecution.none?
+    assert_equal 0, SolidQueue::Semaphore.sole.value
+  end
+
+  test "a deferred job that comes back takes a semaphore again" do
+    spend_budget_of("a")
+    returning = SyncAccountJob.perform_later("a")
+    claim(10)
+
+    travel 10.seconds
+    assert_equal 1, SolidQueue::ScheduledExecution.dispatch_next_batch(10)
+    assert_equal [ returning.provider_job_id ], SolidQueue::ReadyExecution.pluck(:job_id)
+    assert_equal 0, SolidQueue::Semaphore.sole.value
+
+    assert_equal [ returning.provider_job_id ], claim(10).map(&:job_id)
+  end
+
+  test "a deferred job that comes back while its semaphore is taken is blocked, and runs once it's free" do
+    spend_budget_of("a")
+    returning = SyncAccountJob.perform_later("a")
+    claim(10)
+    taking = SyncAccountJob.perform_later("b")
+
+    travel 10.seconds
+    SolidQueue::ScheduledExecution.dispatch_next_batch(10)
+    assert_equal [ returning.provider_job_id ], SolidQueue::BlockedExecution.pluck(:job_id)
+
+    assert_equal [ taking.provider_job_id ], claim(10).each(&:perform).map(&:job_id)
+    assert_equal [ returning.provider_job_id ], claim(10).each(&:perform).map(&:job_id)
+    assert_equal %w[ a b a ], JobBuffer.values
+  end
+
+  test "discarding a deferred job leaves its semaphore alone, once it's waiting and once it came back blocked" do
+    spend_budget_of("a")
+    deferred = SyncAccountJob.perform_later("a")
+    claim(10)
+
+    SolidQueue::Job.find(deferred.provider_job_id).discard
+    assert_equal 1, SolidQueue::Semaphore.sole.value
+
+    deferred = SyncAccountJob.perform_later("a")
+    claim(10)
+    SyncAccountJob.perform_later("b")
+    SolidQueue::ScheduledExecution.update_all(scheduled_at: Time.current)
+    SolidQueue::ScheduledExecution.dispatch_next_batch(10)
+    assert_equal [ deferred.provider_job_id ], SolidQueue::BlockedExecution.pluck(:job_id)
+
+    SolidQueue::Job.find(deferred.provider_job_id).discard
+    assert_equal 0, SolidQueue::Semaphore.sole.value
+  end
+
+  test "a deferred job that recorded no semaphore gives none back" do
+    spend_budget_of("a")
+    deferred = SyncAccountJob.perform_later("a")
+    update_concurrency_lock(deferred) { |arguments| arguments.merge(SolidQueue::Job::CONCURRENCY_LOCK_KEY => { "semaphore_id" => nil, "limit" => nil }) }
+
+    claim(10)
+    assert_equal 0, SolidQueue::Semaphore.sole.value
+  end
+
+  test "a deferred job dispatched before Solid Queue recorded its semaphore gives back its key's" do
+    spend_budget_of("a")
+    deferred = SyncAccountJob.perform_later("a")
+    update_concurrency_lock(deferred) { |arguments| arguments.except(SolidQueue::Job::CONCURRENCY_LOCK_KEY) }
+
+    claim(10)
+    assert_equal 1, SolidQueue::Semaphore.sole.value
+  end
+
+  test "a deferred job whose semaphore expired and was replaced leaves the new one alone" do
+    spend_budget_of("a")
+    deferred = SyncAccountJob.perform_later("a")
+    blocked = SyncAccountJob.perform_later("b")
+    SolidQueue::Semaphore.delete_all
+    SolidQueue::Semaphore.create!(key: SolidQueue::Job.find(deferred.provider_job_id).concurrency_key, value: 0, expires_at: 1.minute.from_now)
+
+    assert_empty claim(10)
+    assert_equal [ deferred.provider_job_id ], SolidQueue::ScheduledExecution.pluck(:job_id)
+    assert_equal 0, SolidQueue::Semaphore.sole.value
+    assert_equal [ blocked.provider_job_id ], SolidQueue::BlockedExecution.pluck(:job_id)
+  end
+
+  test "a deferred job wakes a blocked job whose class is missing, which fails as in Solid Queue" do
+    spend_budget_of("a")
+    SyncAccountJob.perform_later("a")
+    missing = SyncAccountJob.perform_later("b")
+    SolidQueue::Job.where(id: missing.provider_job_id).update_all(class_name: "#{self.class.name}::MissingJob")
+    unlimited = UnlimitedJob.perform_later("behind them")
+
+    assert_equal [ unlimited.provider_job_id ], claim(10).map(&:job_id)
+    assert_equal [ missing.provider_job_id ], SolidQueue::FailedExecution.pluck(:job_id)
+    assert_equal 1, SolidQueue::Semaphore.sole.value
+  end
+
+  test "a blocked job whose class raises when it loads stays blocked, and the claim gives the semaphore back and goes on" do
+    spend_budget_of("a")
+    SyncAccountJob.perform_later("a")
+    broken = SyncAccountJob.perform_later("b")
+    SolidQueue::Job.where(id: broken.provider_job_id).update_all(class_name: "#{self.class.name}::BrokenJob")
+    unlimited = UnlimitedJob.perform_later("behind them")
+    log = StringIO.new
+
+    claimed = SolidQueue.with(logger: ActiveSupport::Logger.new(log)) { claim(10) }
+
+    assert_equal [ unlimited.provider_job_id ], claimed.map(&:job_id)
+    assert_equal [ broken.provider_job_id ], SolidQueue::BlockedExecution.pluck(:job_id)
+    assert_equal 1, SolidQueue::Semaphore.sole.value
+    assert_match(/SyntaxError: broken/, log.string)
+  end
+
+  test "a blocked job whose class raises when it loads doesn't stop a later look" do
+    2.times { |i| LimitedJob.perform_later(i) }
+    claim(10)
+    spend_budget_of("a")
+    deferred = [ LimitedJob.perform_later("first look"), SyncAccountJob.perform_later("a") ]
+    broken = SyncAccountJob.perform_later("b")
+    SolidQueue::Job.where(id: broken.provider_job_id).update_all(class_name: "#{self.class.name}::BrokenJob")
+    unlimited = UnlimitedJob.perform_later("behind them")
+
+    assert_equal [ unlimited.provider_job_id ], SolidQueue.with(logger: ActiveSupport::Logger.new(nil)) { claim(1) }.map(&:job_id)
+    assert_equal provider_ids(deferred), SolidQueue::ScheduledExecution.order(:job_id).pluck(:job_id)
+    assert_equal [ broken.provider_job_id ], SolidQueue::BlockedExecution.pluck(:job_id)
+  end
+
+  test "a job that still has a concurrency key after its class dropped limits_concurrency is rate-checked" do
     jobs = 3.times.map { |i| LimitedJob.perform_later(i) }
     SolidQueue::Job.update_all(concurrency_key: "switched from limits_concurrency")
 
-    assert_equal provider_ids(jobs), claim(10).map(&:job_id)
-    assert_equal 0, SolidQueue::ScheduledExecution.count
+    assert_equal provider_ids(jobs.first(2)), claim(10).map(&:job_id)
+    assert_equal [ jobs.last.provider_job_id ], SolidQueue::ScheduledExecution.pluck(:job_id)
+  end
+
+  test "a job the rate admits keeps its semaphore" do
+    admitted = SyncAccountJob.perform_later("a")
+    blocked = SyncAccountJob.perform_later("b")
+
+    assert_equal [ admitted.provider_job_id ], claim(10).map(&:job_id)
+    assert_equal 0, SolidQueue::Semaphore.sole.value
+    assert_equal [ blocked.provider_job_id ], SolidQueue::BlockedExecution.pluck(:job_id)
+  end
+
+  test "a job the rate rejects gives its semaphore back and waits as a scheduled job" do
+    spend_budget_of("a")
+    deferred = SyncAccountJob.perform_later("a")
+    assert_equal 0, SolidQueue::Semaphore.sole.value
+
+    assert_empty claim(10)
+    assert_equal [ deferred.provider_job_id ], SolidQueue::ScheduledExecution.pluck(:job_id)
+    assert_equal 1, SolidQueue::Semaphore.sole.value
   end
 
   test "a class that dropped its limit has its jobs claimed, deferred ones included" do
@@ -328,6 +562,17 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
       queries
     ensure
       ActiveSupport::Notifications.unsubscribe(subscriber)
+    end
+
+    # Runs a job, which spends the account's budget and gives its slot back
+    def spend_budget_of(account)
+      SyncAccountJob.perform_later(account)
+      claim(10).each(&:perform)
+    end
+
+    def update_concurrency_lock(active_job)
+      job = SolidQueue::Job.find(active_job.provider_job_id)
+      job.update_column(:arguments, yield(job.arguments))
     end
 
     def claim(limit)

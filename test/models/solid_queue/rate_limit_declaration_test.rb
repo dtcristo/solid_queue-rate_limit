@@ -106,35 +106,41 @@ class SolidQueue::RateLimitDeclarationTest < ActiveSupport::TestCase
     assert_equal [ 5, 1.minute, 1 ], [ parent.rate_limit_to, parent.rate_limit_per, parent.rate_limit_burst ]
   end
 
-  test "limits_rate after limits_concurrency raises" do
-    error = assert_raises(ArgumentError) do
-      job do
-        limits_concurrency key: ->(*) { "all" }
-        limits_rate to: 1, per: 1.minute
-      end
-    end
+  test "limits_rate and limits_concurrency combine in either order" do
+    [ proc { limits_concurrency key: ->(*) { "all" }; limits_rate to: 1, per: 1.minute },
+      proc { limits_rate to: 1, per: 1.minute; limits_concurrency key: ->(*) { "all" } } ].each do |declarations|
+      job_class = job(&declarations)
 
-    assert_match(/can't be combined with `limits_concurrency`/, error.message)
-    assert_match(%r{https://github.com/dtcristo/solid_queue-rate_limit/issues/2}, error.message)
+      assert job_class.rate_limited?
+      assert job_class.concurrency_key.present?
+    end
   end
 
-  test "limits_concurrency after limits_rate raises" do
-    error = assert_raises(ArgumentError) do
-      job do
-        limits_rate to: 1, per: 1.minute
-        limits_concurrency key: ->(*) { "all" }
-      end
-    end
-
-    assert_match(%r{https://github.com/dtcristo/solid_queue-rate_limit/issues/2}, error.message)
-  end
-
-  test "the conflict raises through inheritance, in both orders" do
+  test "limits_rate and limits_concurrency combine through inheritance" do
     concurrency_limited = job { limits_concurrency key: ->(*) { "all" } }
     rate_limited = job { limits_rate to: 1, per: 1.minute }
 
-    assert_raises(ArgumentError) { Class.new(concurrency_limited) { limits_rate to: 1, per: 1.minute } }
-    assert_raises(ArgumentError) { Class.new(rate_limited) { limits_concurrency key: ->(*) { "all" } } }
+    [ Class.new(concurrency_limited) { limits_rate to: 1, per: 1.minute }, Class.new(rate_limited) { limits_concurrency key: ->(*) { "all" } } ].each do |job_class|
+      assert job_class.rate_limited?
+      assert job_class.concurrency_key.present?
+    end
+  end
+
+  test "limits_rate with limits_concurrency that discards on conflict raises, in either order" do
+    [ proc { limits_concurrency key: ->(*) { "all" }, on_conflict: :discard; limits_rate to: 1, per: 1.minute },
+      proc { limits_rate to: 1, per: 1.minute; limits_concurrency key: ->(*) { "all" }, on_conflict: :discard } ].each do |declarations|
+      error = assert_raises(ArgumentError) { job(&declarations) }
+
+      assert_equal "`limits_rate` can't be combined with `limits_concurrency(on_conflict: :discard)`", error.message
+    end
+  end
+
+  test "limits_rate with limits_concurrency that discards on conflict raises through inheritance" do
+    discarding = job { limits_concurrency key: ->(*) { "all" }, on_conflict: :discard }
+    rate_limited = job { limits_rate to: 1, per: 1.minute }
+
+    assert_raises(ArgumentError) { Class.new(discarding) { limits_rate to: 1, per: 1.minute } }
+    assert_raises(ArgumentError) { Class.new(rate_limited) { limits_concurrency key: ->(*) { "all" }, on_conflict: :discard } }
   end
 
   private

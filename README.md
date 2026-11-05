@@ -70,7 +70,7 @@ Until the migration has run, everything else works as before, and enqueuing a jo
 
 Each process caches whether the table exists, so restart workers and web processes after you migrate. A deploy usually does that for you.
 
-The gem relies on private Solid Queue methods, so its gemspec allows one minor version of Solid Queue at a time.
+The gem relies on private Solid Queue methods, so its gemspec allows one minor version of Solid Queue at a time, from 1.7.2.
 
 [CHANGELOG.md](CHANGELOG.md) lists what changed in each version.
 
@@ -84,6 +84,7 @@ Start from what the API on the other end allows.
 - [A quota for each account](#give-each-account-a-budget)
 - [One quota for several job classes](#share-a-budget-between-classes)
 - [A quota for each account, used by several job classes](#share-a-budget-for-each-account-between-classes)
+- [One job at a time for each account, under one quota](#run-one-job-at-a-time-for-each-account-under-a-global-rate)
 
 `Account`, `Address`, `Shop`, `Webhook` and the other names in these recipes stand in for your own code.
 
@@ -213,6 +214,24 @@ end
 
 The account with id 7 gets one budget for both classes, stored under `StripeConnect/Account/7`. Each class's Proc gets its own job's arguments, so they can take different ones, as long as they return the same key for the same account.
 
+### Run one job at a time for each account, under a global rate
+
+Use this when two syncs for one account mustn't run at once, and all accounts together have to stay under an API's quota.
+
+```ruby
+class SyncStripeAccountJob < ApplicationJob
+  # One sync at a time for each account, and at most 10 + 100 claims in any minute across all of them
+  limits_concurrency key: ->(account) { account }
+  limits_rate to: 100, per: 1.minute, burst: 10, group: "Stripe"
+
+  def perform(account)
+    account.sync_to_stripe!
+  end
+end
+```
+
+Solid Queue gives each account one concurrency slot, and the gem checks the rate when a worker claims the job. A job over the rate gives its concurrency slot back while it waits, so the account's next blocked job can take it, and takes one again when it comes back. If there's none free by then, the job is blocked, as any job would be. `limits_concurrency` with `on_conflict: :discard` can't be combined with `limits_rate`, because a job that came back to a taken concurrency slot would be discarded.
+
 ## How waiting works
 
 When a worker claims jobs, the gem checks each limited job against its budget, in queue order, inside Solid Queue's claim transaction. A job the budget admits is claimed and runs like any other. A job over the limit moves from `solid_queue_ready_executions` to `solid_queue_scheduled_executions`, with a time to check again. It doesn't take a worker thread, and Active Job doesn't see a retry. When that time comes, the dispatcher makes it ready as usual, and the next claim checks it again.
@@ -271,7 +290,7 @@ These numbers come from 30 to 60 waiting jobs, with one worker polling every 0.1
 - With `burst: 1`, a backlog drains slower than the rate. See [Picking a burst for a backlog](#picking-a-burst-for-a-backlog).
 - A waiting job is a scheduled job with its own `scheduled_at` kept, and checks again at most 5 minutes later. See [How waiting works](#how-waiting-works).
 - Each job class has its own budget, and so does each subclass, unless it declares `key:` or `group:`. See [Rules and limitations](#rules-and-limitations).
-- When the app is eager-loaded and no class declares `limits_rate`, claims run exactly Solid Queue's queries. Otherwise each claim reads the class names of the jobs it locked, and locks one row per budget. When some of those jobs' classes declare `key:` or `group:`, it reads their keys too, in one more query.
+- When the app is eager-loaded and no class declares `limits_rate`, claims run exactly Solid Queue's queries. Otherwise each claim reads the class names of the jobs it locked, and locks one row per budget. When some of those jobs' classes declare `key:` or `group:`, it reads their keys too, in one more query. When it defers jobs that hold a concurrency slot, it loads them, gives their concurrency slots back and wakes the next blocked job for each.
 
 ## Clearing idle budgets
 
@@ -291,7 +310,7 @@ It takes `batch_size:`, 500 by default, and `sleep_between_batches:`, like Solid
 | --- | --- |
 | Ruby | 3.2 and newer |
 | Rails | 7.1, 7.2, 8.0 and 8.1. CI also runs Rails main, except on Ruby 3.2 |
-| Solid Queue | 1.7 |
+| Solid Queue | 1.7.2 and newer within 1.7 |
 | Database | MySQL, PostgreSQL and SQLite |
 
 CI runs Ruby 3.2, 3.3, 3.4 and 4.0 against all three databases.
@@ -334,7 +353,7 @@ Changing a limit and deploying applies to the next claim. A looser limit doesn't
 - A key longer than `solid_queue_rate_limits.key` allows, 255 characters on MySQL, raises `ActiveRecord::ValueTooLong` at enqueue, as an over-long concurrency key does. `perform_later` raises it wrapped in `SolidQueue::Job::EnqueueError`, and `perform_all_later` raises it as it is. PostgreSQL and SQLite have no limit.
 - A retry keeps the key its job was enqueued with. That covers a `retry_on` retry, a failed job you retry, and a retry after the arguments failed to deserialize.
 - A job enqueued before its class declared `key:` or `group:`, or still waiting after the class stops declaring them, uses the class's budget.
-- `limits_rate` and `limits_concurrency` on the same class raise `ArgumentError` in either order, and through inheritance, until [#2](https://github.com/dtcristo/solid_queue-rate_limit/issues/2). A job that still has a concurrency key, after its class switched from one to the other, is admitted without a rate check, because it holds its semaphore while it waits.
+- `limits_rate` combines with `limits_concurrency`, in either order and through inheritance. A job over the rate gives its concurrency slot back and wakes the next blocked job for its key once the claim commits, and takes one again when the dispatcher brings it back, or is blocked. `limits_concurrency` with `on_conflict: :discard` raises `ArgumentError` with `limits_rate`, because a job that came back to a taken concurrency slot would be discarded. A job that still has a concurrency key after its class dropped `limits_concurrency` is checked like any other.
 - Without `key:` or `group:`, the budget is stored under the class's name. A job enqueued under an alias, such as a constant kept after a rename, shares the class's budget. On MySQL, two classes whose names differ only in case share one budget.
 - A job whose class doesn't load, or whose `class_name` isn't a job class, is claimed without a check and fails as it would without the gem.
 - A class that drops its limit has its waiting jobs claimed when they next check, at most 5 minutes later.
@@ -347,7 +366,7 @@ The design, and the costs behind these rules, are in [the design notes](https://
 | --- | --- | --- |
 | `defer_rate_limited.solid_queue` | A claim sent a class's jobs to wait | `class_name`, `keys`, `job_ids`, `size` |
 
-A claim instruments one event for each class it deferred, inside its transaction. If the claim then rolls back, the event has still fired. `keys` lists the budgets that deferred them, once each. A job can wait more than once, so `size` counts deferrals, not distinct jobs.
+A claim instruments one event for each class it deferred, inside its transaction. If the claim then rolls back, the event has still fired. `keys` lists the budgets that deferred them, once each. A job can wait more than once, so `size` counts deferrals, not distinct jobs. Jobs of a class that also declares `limits_concurrency` are included, and each blocked job one of them wakes instruments Solid Queue's own `release_blocked.solid_queue`.
 
 `SolidQueue::LogSubscriber` logs it at debug level:
 
@@ -371,7 +390,7 @@ Tests that run jobs through Solid Queue need the table in the test queue databas
 
 ## Roadmap
 
-[#10](https://github.com/dtcristo/solid_queue-rate_limit/issues/10) tracks what's planned, including multiple limits per job, combining with `limits_concurrency`, and feedback from an API's 429 responses.
+[#10](https://github.com/dtcristo/solid_queue-rate_limit/issues/10) tracks what's planned, including multiple limits per job and feedback from an API's 429 responses.
 
 ## License
 

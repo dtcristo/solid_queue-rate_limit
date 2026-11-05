@@ -87,6 +87,13 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
     def perform(account, amount); end
   end
 
+  class StripeAccountSyncJob < ApplicationJob
+    limits_concurrency key: ->(account) { account }
+    limits_rate to: 100, per: 1.minute, burst: 10, group: "RecipesStripeSync"
+
+    def perform(account); end
+  end
+
   CLAIM_DELAYS = [ 0.08, 0.02, 0.05 ]
 
   setup do
@@ -202,6 +209,18 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
     end
   end
 
+  test "per-account concurrency under a global rate runs one job per account at a time, and all of them stay under the rate" do
+    ActiveJob.perform_all_later(%w[ a b c d e ].flat_map { |account| Array.new(30) { StripeAccountSyncJob.new(account) } })
+
+    claims = run_dispatcher_and_worker(2.minutes) { |job_ids| first_arguments(job_ids) }
+    times = claims.map(&:first)
+
+    assert_equal 150, claims.size
+    assert_operator most_in_any(60, times), :<=, 100 + 10
+    assert_operator times.max, :<=, (150 - 10) * 0.6 + 1.5
+    claims.group_by(&:first).each_value { |claimed_together| assert_equal claimed_together.map(&:last).uniq, claimed_together.map(&:last) }
+  end
+
   test "the recurring task clears idle budgets and keeps the others" do
     task = SolidQueue::RecurringTask.from_configuration("clear_solid_queue_rate_limits", command: "SolidQueue::RateLimitState.clear_idle_in_batches(sleep_between_batches: 0.3)", schedule: "every hour at minute 27")
     ActiveJob.perform_all_later(%w[ a b ].map { |shop| PerShopJob.new(shop) })
@@ -223,7 +242,8 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
     end
 
     # Returns when each job was claimed, in seconds from the start, sorted. With a block,
-    # pairs each time with what the block returns for the claim's job IDs.
+    # pairs each time with what the block returns for the claim's job IDs. Each job runs
+    # as soon as it's claimed, so it gives back any concurrency slot it holds.
     def run_dispatcher_and_worker(duration, poll: 1)
       claims = []
 
@@ -235,7 +255,7 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
         job_ids = SolidQueue::ReadyExecution.claim("*", 500, @process.id).map(&:job_id)
         labels = block_given? ? yield(job_ids) : job_ids
         claims.concat(labels.map { |label| block_given? ? [ Time.current - @start, label ] : Time.current - @start })
-        SolidQueue::Job.where(id: job_ids).destroy_all
+        SolidQueue::ClaimedExecution.where(job_id: job_ids).each(&:perform)
       end
 
       claims.sort

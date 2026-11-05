@@ -31,6 +31,21 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
     def perform; end
   end
 
+  # One at a time for each account, under a rate for all of them. Each run takes
+  # long enough that two runs for one account would overlap.
+  class SyncAccountJob < ApplicationJob
+    limits_concurrency key: ->(account) { account }
+    limits_rate to: 10, per: 1.second, burst: 3
+
+    cattr_accessor :runs
+
+    def perform(account)
+      started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      sleep 0.05
+      runs&.push([ account, started_at, Process.clock_gettime(Process::CLOCK_MONOTONIC) ])
+    end
+  end
+
   # Records the time each admission was charged at, in the thread that charged it.
   # A claim starts some time after that, so timing claims would misjudge the rate.
   module RecordAdmissions
@@ -47,6 +62,7 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
   setup do
     @processes = Array.new(WORKERS) { |i| SolidQueue::Process.register(kind: "Worker", pid: 42, name: "rate-limit-concurrency-worker-#{i}") }
     @claims = Queue.new
+    @claimed_at = Concurrent::Map.new
     @admissions = Queue.new
 
     @claim_subscriber = ActiveSupport::Notifications.subscribe("claim.solid_queue") do |*, payload|
@@ -65,6 +81,7 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
   teardown do
     ActiveSupport::Notifications.unsubscribe(@claim_subscriber)
     ActiveSupport::Notifications.unsubscribe(@transaction_subscriber)
+    SyncAccountJob.runs = nil
   end
 
   test "claiming threads and a dispatcher keep every limit, and claim every job once" do
@@ -74,6 +91,37 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
 
     assert_empty errors
     assert_claimed_once_within_limits job_classes
+  end
+
+  test "claiming threads and a dispatcher keep both limits of a class that declares them, and jobs behind its backlog keep moving" do
+    SyncAccountJob.runs = Queue.new
+    deferrals = Queue.new
+    subscriber = ActiveSupport::Notifications.subscribe("defer_rate_limited.solid_queue") { |*, payload| deferrals << payload[:size] if payload[:class_name] == SyncAccountJob.name }
+
+    # Most of each account's jobs are blocked on its semaphore, with unlimited jobs behind them
+    ActiveJob.perform_all_later(Array.new(30) { |i| SyncAccountJob.new(%w[ a b c ][i % 3]) })
+    ActiveJob.perform_all_later(Array.new(20) { UnlimitedJob.new })
+    job_classes = SolidQueue::Job.pluck(:id, :class_name).to_h
+    unlimited = job_classes.select { |_, class_name| class_name == UnlimitedJob.name }.keys
+    started_at = Time.current
+
+    errors = run_workers_and_dispatcher(until_done: job_classes.size, timeout: 15.seconds)
+
+    assert_empty errors
+    assert_claimed_once_within_limits job_classes, SyncAccountJob.name => [ SyncAccountJob, 30 ]
+
+    runs = Array.new(SyncAccountJob.runs.size) { SyncAccountJob.runs.pop }
+    assert_equal 30, runs.size
+    runs.group_by(&:first).each do |account, account_runs|
+      account_runs.sort_by(&:second).each_cons(2) do |(_, _, finished_at), (_, next_started_at, _)|
+        assert_operator next_started_at, :>=, finished_at, "account #{account} ran two jobs at once"
+      end
+    end
+
+    assert_operator unlimited.map { |job_id| @claimed_at[job_id] }.max - started_at, :<, 2.seconds, "unlimited jobs behind the backlog keep moving"
+    assert_operator Array.new(deferrals.size) { deferrals.pop }.sum, :<=, 2 * 30, "deferrals stay bounded"
+  ensure
+    ActiveSupport::Notifications.unsubscribe(subscriber)
   end
 
   # Claims open IMMEDIATE transactions on Rails 8, but another connection can still
@@ -126,16 +174,25 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
       SolidQueue::Job.pluck(:id, :class_name).to_h
     end
 
-    def assert_claimed_once_within_limits(job_classes)
+    # The limits enqueue_jobs sets up, each with the class it's charged with and how many jobs it admits
+    def enqueued_limits(job_classes)
+      {
+        TenASecondJob.name => [ TenASecondJob, job_classes.values.count(TenASecondJob.name) ],
+        FiveASecondJob.name => [ FiveASecondJob, job_classes.values.count(FiveASecondJob.name) ],
+        "Grouped/a" => [ GroupedJob, 10 ],
+        "Grouped/b" => [ GroupedJob, 10 ]
+      }
+    end
+
+    def assert_claimed_once_within_limits(job_classes, limits = enqueued_limits(job_classes))
       claims = Array.new(@claims.size) { @claims.pop }
       admissions = Array.new(@admissions.size) { @admissions.pop }
 
       assert_equal job_classes.keys.sort, claims.sort, "every job is claimed exactly once"
       assert SolidQueue::Job.where(finished_at: nil).none?
 
-      { TenASecondJob.name => TenASecondJob, FiveASecondJob.name => FiveASecondJob, "Grouped/a" => GroupedJob, "Grouped/b" => GroupedJob }.each do |key, job_class|
+      limits.each do |key, (job_class, expected)|
         times = admissions.select { |admitted_key, _| admitted_key == key }.map(&:last).sort
-        expected = key.start_with?("Grouped") ? 10 : job_classes.values.count(job_class.name)
         assert_equal expected, times.size, "#{key} is admitted once for each job"
         assert_within_rate job_class, times
         assert_operator times.last - times.first, :<=, (times.size - job_class.rate_limit_burst) * job_class.rate_limit_interval + 3, "#{key} drains in bounded time"
@@ -156,6 +213,7 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
             while running.call
               begin
                 executions = SolidQueue::ReadyExecution.claim("*", CAPACITY, process.id)
+                executions.each { |execution| @claimed_at[execution.job_id] = Time.current }
                 executions.each(&:perform)
                 claimed.increment(executions.size)
               rescue => error
