@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `key:` and `group:` for `limits_rate`, which take what `limits_concurrency` takes. `key:` gives each value a budget of its own, such as one for each account, and `group:` shares a budget between the classes that name it. The key is built like Solid Queue's concurrency key, worked out once when Solid Queue enqueues the job, and kept by its retries. Classes without either keep their 0.1.0 budget, and upgrading needs no migration. ([#19](https://github.com/dtcristo/solid_queue-rate_limit/pull/19))
+- `rate_limit_key` and `rate_limit_group` on job classes. ([#19](https://github.com/dtcristo/solid_queue-rate_limit/pull/19))
+- `keys` in the `defer_rate_limited.solid_queue` payload and its log line, listing the budgets that deferred jobs. ([#19](https://github.com/dtcristo/solid_queue-rate_limit/pull/19))
+
+### Changed
+
+- `name:` still raises `ArgumentError`, and now links to [#14](https://github.com/dtcristo/solid_queue-rate_limit/issues/14), which tracks multiple limits. ([#19](https://github.com/dtcristo/solid_queue-rate_limit/pull/19))
+- A claim whose first pass deadlocks runs that pass once more instead of raising, so a deadlock no longer stops the worker. On MySQL, claims that insert a new budget's row at the same time can deadlock, which `key:` makes common. A second deadlock still raises. ([#19](https://github.com/dtcristo/solid_queue-rate_limit/pull/19))
+
 ## [0.1.0] - 2026-11-04
 
 The first release adds `limits_rate`, so workers claim a job class's jobs no faster than a declared rate, and jobs over it wait as scheduled jobs. Install it with `bin/rails generate solid_queue:rate_limit:install`, and there's nothing to upgrade from. The [README](https://github.com/dtcristo/solid_queue-rate_limit/blob/main/README.md#what-the-limit-guarantees) states what the limit guarantees and how to pick a `burst` for a backlog.

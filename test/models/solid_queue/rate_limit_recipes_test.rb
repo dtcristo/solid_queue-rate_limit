@@ -57,6 +57,36 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
     def perform; end
   end
 
+  class PerShopJob < ApplicationJob
+    limits_rate to: 2, per: 1.second, burst: 3, key: ->(shop) { shop }
+
+    def perform(shop); end
+  end
+
+  class StripeCustomerJob < ApplicationJob
+    limits_rate to: 90, per: 1.minute, burst: 10, group: "RecipesStripe"
+
+    def perform(account); end
+  end
+
+  class StripeRefundJob < ApplicationJob
+    limits_rate to: 90, per: 1.minute, burst: 10, group: "RecipesStripe"
+
+    def perform(charge); end
+  end
+
+  class ConnectAccountJob < ApplicationJob
+    limits_rate to: 25, per: 1.second, burst: 28, group: "RecipesStripeConnect", key: ->(account) { account }
+
+    def perform(account); end
+  end
+
+  class ConnectTransferJob < ApplicationJob
+    limits_rate to: 25, per: 1.second, burst: 28, group: "RecipesStripeConnect", key: ->(account, _amount) { account }
+
+    def perform(account, amount); end
+  end
+
   CLAIM_DELAYS = [ 0.08, 0.02, 0.05 ]
 
   setup do
@@ -135,7 +165,48 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
     assert_operator slow.size, :<, 450
   end
 
+  test "a key gives each account a budget of its own, and each drains at the full rate" do
+    ActiveJob.perform_all_later(%w[ a b ].flat_map { |shop| Array.new(20) { PerShopJob.new(shop) } })
+
+    claims = run_dispatcher_and_worker(15.seconds) { |job_ids| first_arguments(job_ids) }
+
+    %w[ a b ].each do |shop|
+      times = claims.filter_map { |time, label| time if label == shop }
+      assert_equal 20, times.size
+      assert_operator most_in_any(1, times), :<=, 3 + 2
+      assert_operator times.max, :<=, (20 - 3) / 2.0 + 1.5
+    end
+  end
+
+  test "classes in a group stay under one quota together" do
+    ActiveJob.perform_all_later(Array.new(150) { |i| StripeCustomerJob.new(i) } + Array.new(150) { |i| StripeRefundJob.new(i) })
+
+    claims = run_dispatcher_and_worker(3.minutes) { |job_ids| SolidQueue::Job.where(id: job_ids).pluck(:class_name) }
+    times = claims.map(&:first)
+
+    assert_operator most_in_any(60, times), :<=, 90 + 10
+    assert_operator times.size, :>=, 10 + 90 * 3 - 2
+    assert_equal [ StripeCustomerJob.name, StripeRefundJob.name ], claims.map(&:last).uniq.sort
+  end
+
+  test "classes in a group with a key share each account's budget, and each account drains at the full rate" do
+    ActiveJob.perform_all_later(%w[ a b ].flat_map { |account| Array.new(40) { ConnectAccountJob.new(account) } + Array.new(40) { |i| ConnectTransferJob.new(account, i) } })
+
+    claims = run_dispatcher_and_worker(5.seconds, poll: 1) { |job_ids| first_arguments(job_ids) }
+
+    %w[ a b ].each do |account|
+      times = claims.filter_map { |time, label| time if label == account }
+      assert_equal 80, times.size
+      assert_operator most_in_any(1, times), :<=, 28 + 25
+      assert_operator times.max, :<=, (80 - 28) / 25.0 + 1.5
+    end
+  end
+
   private
+    def first_arguments(job_ids)
+      SolidQueue::Job.where(id: job_ids).map { |job| job.arguments["arguments"].first }
+    end
+
     # Returns when each job was claimed, in seconds from the start, sorted. With a block,
     # pairs each time with what the block returns for the claim's job IDs.
     def run_dispatcher_and_worker(duration, poll: 1)

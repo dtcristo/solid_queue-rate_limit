@@ -10,6 +10,9 @@ module SolidQueue
       #
       # A pass that deferred jobs leaves threads idle that could run jobs behind them,
       # so the claim looks again, each time in a transaction of its own.
+      #
+      # Claims that insert a new budget's row at once can deadlock on MySQL, and a
+      # deadlock in the first pass would stop the worker, so that pass runs once more.
       module Claiming
         MAX_CLAIM_PASSES = 5
 
@@ -18,14 +21,21 @@ module SolidQueue
             return super unless RateLimit.enforced? && !connection_pool.with_connection(&:transaction_open?)
 
             claimed = []
+            retried = false
 
             MAX_CLAIM_PASSES.times do |pass|
-              claimed += super(queue_relation, process_id, limit - claimed.size)
+              begin
+                claimed += super(queue_relation, process_id, limit - claimed.size)
+              rescue ActiveRecord::Deadlocked
+                # Whatever earlier passes claimed has been committed
+                break if pass.positive?
+                raise if retried
+
+                retried = true
+                retry
+              end
+
               break unless claimed.size < limit && rate_limit_deferred_in_pass?
-            rescue ActiveRecord::Deadlocked
-              # Whatever earlier passes claimed has been committed
-              raise if pass.zero?
-              break
             end
 
             claimed
@@ -84,6 +94,6 @@ class SolidQueue::LogSubscriber
   subscribe_log_level :defer_rate_limited, :debug
 
   def defer_rate_limited(event) # :nodoc:
-    debug formatted_event(event, action: "Defer rate-limited jobs", **event.payload.slice(:class_name, :job_ids, :size))
+    debug formatted_event(event, action: "Defer rate-limited jobs", **event.payload.slice(:class_name, :keys, :job_ids, :size))
   end
 end

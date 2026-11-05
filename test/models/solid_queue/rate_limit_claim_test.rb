@@ -71,7 +71,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
 
     claim(10)
 
-    assert_equal [ { class_name: LimitedJob.name, job_ids: [ jobs.last.provider_job_id ], size: 1 } ], events
+    assert_equal [ { class_name: LimitedJob.name, keys: [ LimitedJob.name ], job_ids: [ jobs.last.provider_job_id ], size: 1 } ], events
   ensure
     ActiveSupport::Notifications.unsubscribe(subscriber)
   end
@@ -235,11 +235,21 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     assert_equal Time.current + 10.seconds, SolidQueue::RateLimitState.sole.deferred_until
   end
 
-  test "a deadlock in a claim's first look raises and rolls it back" do
+  test "a deadlock in a claim's first look rolls it back and looks once more" do
+    limited = 3.times.map { |i| LimitedJob.perform_later(i) }
+
+    claimed = deadlocking_on("SolidQueue::ScheduledExecution Insert", occurrence: 1) { claim(3) }
+
+    assert_equal provider_ids(limited.first(2)), claimed.map(&:job_id)
+    assert_equal [ limited.third.provider_job_id ], SolidQueue::ScheduledExecution.pluck(:job_id)
+    assert_equal Time.current + 10.seconds, SolidQueue::RateLimitState.sole.deferred_until
+  end
+
+  test "a second deadlock in a claim's first look raises and rolls it back" do
     3.times { |i| LimitedJob.perform_later(i) }
 
     assert_raises(ActiveRecord::Deadlocked) do
-      deadlocking_on("SolidQueue::ScheduledExecution Insert", occurrence: 1) { claim(3) }
+      deadlocking_on("SolidQueue::ScheduledExecution Insert", occurrence: 1..2) { claim(3) }
     end
 
     assert_equal 3, SolidQueue::ReadyExecution.count
@@ -266,21 +276,31 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     assert_equal [ "SolidQueue::Pause Pluck", "TRANSACTION", "SolidQueue::ReadyExecution Load", "SolidQueue::ClaimedExecution Insert", "SolidQueue::ClaimedExecution Load", "SolidQueue::ReadyExecution Delete All", "TRANSACTION" ], queries
   end
 
+  test "a limited class without a key or a group claims with the same queries as 0.1.0" do
+    3.times { |i| LimitedJob.perform_later(i) }
+    SolidQueue::RateLimitState.create!(key: LimitedJob.name, tat: Time.current)
+
+    queries = capture_queries { claim(10) }
+
+    assert_equal [ "SolidQueue::Pause Pluck", "TRANSACTION", "SolidQueue::ReadyExecution Load", "SolidQueue::Job Load", "SolidQueue::RateLimitState Pluck", "SolidQueue::RateLimitState Load", "SolidQueue::RateLimitState Update", "SolidQueue::ScheduledExecution Insert", "SolidQueue::ClaimedExecution Bulk Insert", "SolidQueue::ClaimedExecution Load", "SolidQueue::ReadyExecution Delete All", "SolidQueue::ReadyExecution Delete All", "TRANSACTION", "TRANSACTION", "SolidQueue::ReadyExecution Load", "TRANSACTION" ], queries
+  end
+
   private
     # Raises once the given query has run, as InnoDB or PostgreSQL would for a deadlock victim
     def deadlocking_on(query_name, occurrence:, &block)
       seen = 0
       subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
-        raise ActiveRecord::Deadlocked, "Deadlock found" if payload[:name] == query_name && (seen += 1) == occurrence
+        raise ActiveRecord::Deadlocked, "Deadlock found" if payload[:name] == query_name && Array(occurrence).include?(seen += 1)
       end
       block.call
     ensure
       ActiveSupport::Notifications.unsubscribe(subscriber)
     end
 
+    # Schema queries depend on which test loaded a model's columns first
     def capture_queries(&block)
       queries = []
-      subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") { |event| queries << event.payload[:name] }
+      subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") { |event| queries << event.payload[:name] unless event.payload[:name] == "SCHEMA" }
       block.call
       queries
     ensure

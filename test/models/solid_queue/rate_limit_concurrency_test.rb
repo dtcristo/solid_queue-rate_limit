@@ -18,6 +18,15 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
     def perform; end
   end
 
+  # Two classes sharing a group, with a budget for each key
+  class GroupedJob < ApplicationJob
+    limits_rate to: 5, per: 1.second, burst: 2, group: "Grouped", key: ->(account) { account }
+
+    def perform(account); end
+  end
+
+  class OtherGroupedJob < GroupedJob; end
+
   class UnlimitedJob < ApplicationJob
     def perform; end
   end
@@ -112,6 +121,7 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
 
       ActiveJob.perform_all_later(Array.new(30) { TenASecondJob.new } + Array.new(15) { FiveASecondJob.new } + Array.new(30) { UnlimitedJob.new })
       ActiveJob.perform_all_later(Array.new(30) { [ TenASecondJob.new, FiveASecondJob.new, UnlimitedJob.new ].sample })
+      ActiveJob.perform_all_later(Array.new(20) { |i| [ GroupedJob, OtherGroupedJob ][i % 2].new(%w[ a b ][i / 10]) })
 
       SolidQueue::Job.pluck(:id, :class_name).to_h
     end
@@ -123,11 +133,12 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
       assert_equal job_classes.keys.sort, claims.sort, "every job is claimed exactly once"
       assert SolidQueue::Job.where(finished_at: nil).none?
 
-      [ TenASecondJob, FiveASecondJob ].each do |job_class|
-        times = admissions.select { |key, _| key == job_class.name }.map(&:last).sort
-        assert_equal job_classes.values.count(job_class.name), times.size, "#{job_class.name} is admitted once for each job"
+      { TenASecondJob.name => TenASecondJob, FiveASecondJob.name => FiveASecondJob, "Grouped/a" => GroupedJob, "Grouped/b" => GroupedJob }.each do |key, job_class|
+        times = admissions.select { |admitted_key, _| admitted_key == key }.map(&:last).sort
+        expected = key.start_with?("Grouped") ? 10 : job_classes.values.count(job_class.name)
+        assert_equal expected, times.size, "#{key} is admitted once for each job"
         assert_within_rate job_class, times
-        assert_operator times.last - times.first, :<=, (times.size - job_class.rate_limit_burst) * job_class.rate_limit_interval + 3, "#{job_class.name} drains in bounded time"
+        assert_operator times.last - times.first, :<=, (times.size - job_class.rate_limit_burst) * job_class.rate_limit_interval + 3, "#{key} drains in bounded time"
       end
     end
 
