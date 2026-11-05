@@ -235,11 +235,21 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     assert_equal Time.current + 10.seconds, SolidQueue::RateLimitState.sole.deferred_until
   end
 
-  test "a deadlock in a claim's first look raises and rolls it back" do
+  test "a deadlock in a claim's first look rolls it back and looks once more" do
+    limited = 3.times.map { |i| LimitedJob.perform_later(i) }
+
+    claimed = deadlocking_on("SolidQueue::ScheduledExecution Insert", occurrence: 1) { claim(3) }
+
+    assert_equal provider_ids(limited.first(2)), claimed.map(&:job_id)
+    assert_equal [ limited.third.provider_job_id ], SolidQueue::ScheduledExecution.pluck(:job_id)
+    assert_equal Time.current + 10.seconds, SolidQueue::RateLimitState.sole.deferred_until
+  end
+
+  test "a second deadlock in a claim's first look raises and rolls it back" do
     3.times { |i| LimitedJob.perform_later(i) }
 
     assert_raises(ActiveRecord::Deadlocked) do
-      deadlocking_on("SolidQueue::ScheduledExecution Insert", occurrence: 1) { claim(3) }
+      deadlocking_on("SolidQueue::ScheduledExecution Insert", occurrence: 1..2) { claim(3) }
     end
 
     assert_equal 3, SolidQueue::ReadyExecution.count
@@ -280,7 +290,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     def deadlocking_on(query_name, occurrence:, &block)
       seen = 0
       subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
-        raise ActiveRecord::Deadlocked, "Deadlock found" if payload[:name] == query_name && (seen += 1) == occurrence
+        raise ActiveRecord::Deadlocked, "Deadlock found" if payload[:name] == query_name && Array(occurrence).include?(seen += 1)
       end
       block.call
     ensure

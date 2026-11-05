@@ -175,7 +175,7 @@ Inside an outer transaction, the gem runs a single pass, with admission but with
 
 The lock order rules out cycles on the state rows. InnoDB can still deadlock through gap locks, for example when two claims insert neighbouring missing keys.
 
-Each refill pass rescues `ActiveRecord::Deadlocked`. A deadlock on the first pass raises, as it would without the gem, and the pass rolls back. A deadlock on a later pass rolls back only that pass, and the claim returns what earlier passes committed.
+Each refill pass rescues `ActiveRecord::Deadlocked`. A deadlock on the first pass rolls it back, and the pass runs once more. With `key:`, claims insert new budgets' rows often, and on MySQL two claims inserting the same row can deadlock. Solid Queue's poller doesn't rescue errors, so raising would stop the worker until the supervisor replaces it. A second deadlock on the first pass raises. A deadlock on a later pass rolls back only that pass, and the claim returns what earlier passes committed.
 
 ## Fast path
 
@@ -228,7 +228,7 @@ A dispatcher poll also makes about `to × polling_interval / per` jobs due at on
 
 - Capped staggering on a large, slow backlog isn't stress-tested. With 10,000 jobs at 1 per minute, 5 jobs hold slots and the rest come back every 5 minutes, about 33 dispatches and deferrals a second for nothing.
 - On Rails 7.x, SQLite transactions are DEFERRED, so a claim starts as a reader and upgrades to a writer. The dummy app opens IMMEDIATE transactions on every Rails version, so the suite has never run claims on Rails 7.x's default.
-- On MySQL, a claim's scheduled inserts and the dispatcher's ready inserts could take gap locks that deadlock each other. Testing hasn't shown it. A deadlock on a claim's first pass raises as it would without the gem.
+- On MySQL, a claim's scheduled inserts and the dispatcher's ready inserts could take gap locks that deadlock each other. Testing hasn't shown it. A deadlock on a claim's first pass runs the pass once more, and a second one raises.
 - With `burst: 1`, a backlog drains at about half to nine tenths of the rate. See [Throughput with a small burst](#throughput-with-a-small-burst). [#6](https://github.com/dtcristo/solid_queue-rate_limit/issues/6) is the place to change that.
 
 ## Where it lives
