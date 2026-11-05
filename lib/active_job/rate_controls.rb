@@ -5,6 +5,7 @@ module ActiveJob
   module RateControls
     extend ActiveSupport::Concern
 
+    DEFAULT_RATE_LIMIT_GROUP = ->(*) { self.class.name }
     MIN_RATE_LIMIT_INTERVAL = 0.001
 
     # Stored in the job's serialized Active Job data, which Active Job ignores when running the job
@@ -15,7 +16,7 @@ module ActiveJob
       class_attribute :rate_limit_per, instance_accessor: false
       class_attribute :rate_limit_burst, instance_accessor: false
       class_attribute :rate_limit_key, instance_accessor: false
-      class_attribute :rate_limit_group, instance_accessor: false
+      class_attribute :rate_limit_group, default: DEFAULT_RATE_LIMIT_GROUP, instance_accessor: false
     end
 
     module ClassMethods
@@ -24,7 +25,7 @@ module ActiveJob
       # a worker thread or a retry, and is checked again when it's dispatched.
       #
       #   class SyncStripeJob < ApplicationJob
-      #     limits_rate to: 100, per: 1.minute, burst: 10
+      #     limits_rate to: 100, per: 1.minute, burst: 10, key: :global
       #   end
       #
       # ==== Options
@@ -32,9 +33,10 @@ module ActiveJob
       # * +:to+ - Required. A positive integer, how many jobs a +per+ admits.
       # * +:per+ - Required. A positive duration. Admissions are spaced <tt>per / to</tt>
       #   apart, which has to be at least 1 ms.
+      # * +:key+ - Required. A String or Symbol literal, or a Proc that receives the job's
+      #   arguments, as in +limits_concurrency+. Each value gets a budget of its own. A
+      #   +nil+ or +false+ key turns the limit off, as it turns off +limits_concurrency+.
       # * +:burst+ - How many jobs a fully recovered budget admits at once. Defaults to 1.
-      # * +:key+ - Splits the budget, so each value gets one of its own. A String or Symbol
-      #   literal, or a Proc that receives the job's arguments, as in +limits_concurrency+.
       # * +:group+ - Shares the budget with every class that names the same group. Takes
       #   the same values as +:key+. Defaults to the class's name.
       #
@@ -45,7 +47,7 @@ module ActiveJob
       # A subclass inherits the limit, key and group. Without a group it has its own
       # budget, and it can redeclare the limit. An invalid option raises +ArgumentError+.
       # +perform_now+ and other adapters don't enforce it, and never compute the key.
-      def limits_rate(to:, per:, burst: 1, key: nil, group: nil, **options)
+      def limits_rate(to:, per:, key:, burst: 1, group: DEFAULT_RATE_LIMIT_GROUP, **options)
         if options.key?(:name)
           raise ArgumentError, "`name` isn't supported yet. Follow https://github.com/dtcristo/solid_queue-rate_limit/issues/14 for multiple limits"
         elsif options.any?
@@ -72,7 +74,7 @@ module ActiveJob
           raise ArgumentError, "#{name || "This class"} already declares `limits_rate`"
         end
 
-        ensure_rate_limit_compatible_with_concurrency_controls(rate_limited: true)
+        ensure_rate_limit_compatible_with_concurrency_controls(rate_limited: key)
 
         @rate_limit_declared = SolidQueue::RateLimit.declared = true
         self.rate_limit_to = to
@@ -83,12 +85,7 @@ module ActiveJob
       end
 
       def rate_limited?
-        rate_limit_to.present?
-      end
-
-      # Whether a job's key is stored with it, rather than being the class's name
-      def rate_limit_keyed? # :nodoc:
-        rate_limited? && [ rate_limit_key, rate_limit_group ].any?
+        rate_limit_key ? true : false
       end
 
       # The seconds between admissions
@@ -118,9 +115,7 @@ module ActiveJob
       if self.class.rate_limited? && self.class.queue_adapter_name == "solid_queue"
         raise SolidQueue::RateLimitState::PendingMigrations unless SolidQueue::RateLimitState.migrated?
 
-        if self.class.rate_limit_keyed?
-          @rate_limit_key ||= rate_limit_key.presence&.tap { |key| ensure_rate_limit_key_fits(key) }
-        end
+        @rate_limit_key ||= rate_limit_key.presence&.tap { |key| ensure_rate_limit_key_fits(key) }
       end
 
       @rate_limit_key ? super.merge(RATE_LIMIT_KEY => @rate_limit_key) : super
@@ -132,7 +127,7 @@ module ActiveJob
     end
 
     def rate_limit_key # :nodoc:
-      if self.class.rate_limit_keyed?
+      if self.class.rate_limited?
         param = compute_concurrency_parameter(self.class.rate_limit_key)
 
         case param
@@ -153,7 +148,7 @@ module ActiveJob
       end
 
       def rate_limit_group
-        self.class.rate_limit_group ? compute_concurrency_parameter(self.class.rate_limit_group) : self.class.name
+        compute_concurrency_parameter(self.class.rate_limit_group)
       end
   end
 end

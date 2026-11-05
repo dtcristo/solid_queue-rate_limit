@@ -9,50 +9,50 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   class QuotaJob < ApplicationJob
-    limits_rate to: 90, per: 1.minute, burst: 10
+    limits_rate to: 90, per: 1.minute, burst: 10, key: :global
 
     def perform; end
   end
 
   class SpacedJob < ApplicationJob
-    limits_rate to: 1, per: 5.seconds
+    limits_rate to: 1, per: 5.seconds, key: :global
 
     def perform; end
   end
 
   class FullRateJob < ApplicationJob
-    limits_rate to: 5, per: 1.second, burst: 6
+    limits_rate to: 5, per: 1.second, burst: 6, key: :global
 
     def perform; end
   end
 
   class FastPollJob < ApplicationJob
-    limits_rate to: 5, per: 1.second, burst: 2
+    limits_rate to: 5, per: 1.second, burst: 2, key: :global
 
     def perform; end
   end
 
   class OneBurstJob < ApplicationJob
-    limits_rate to: 1, per: 1.second
+    limits_rate to: 1, per: 1.second, key: :global
 
     def perform; end
   end
 
   class TwoBurstJob < ApplicationJob
-    limits_rate to: 1, per: 1.second, burst: 2
+    limits_rate to: 1, per: 1.second, burst: 2, key: :global
 
     def perform; end
   end
 
   # 100 × (0.1 + 0.1) / 1 = 20, and 11 only covers the dispatcher's poll
   class HundredBurstTwentyJob < ApplicationJob
-    limits_rate to: 100, per: 1.second, burst: 20
+    limits_rate to: 100, per: 1.second, burst: 20, key: :global
 
     def perform; end
   end
 
   class HundredBurstElevenJob < ApplicationJob
-    limits_rate to: 100, per: 1.second, burst: 11
+    limits_rate to: 100, per: 1.second, burst: 11, key: :global
 
     def perform; end
   end
@@ -64,13 +64,13 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
   end
 
   class StripeCustomerJob < ApplicationJob
-    limits_rate to: 90, per: 1.minute, burst: 10, group: "RecipesStripe"
+    limits_rate to: 90, per: 1.minute, burst: 10, group: "RecipesStripe", key: :global
 
     def perform(account); end
   end
 
   class StripeRefundJob < ApplicationJob
-    limits_rate to: 90, per: 1.minute, burst: 10, group: "RecipesStripe"
+    limits_rate to: 90, per: 1.minute, burst: 10, group: "RecipesStripe", key: :global
 
     def perform(charge); end
   end
@@ -89,7 +89,7 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
 
   class StripeAccountSyncJob < ApplicationJob
     limits_concurrency key: ->(account) { account }
-    limits_rate to: 100, per: 1.minute, burst: 10, group: "RecipesStripeSync"
+    limits_rate to: 100, per: 1.minute, burst: 10, group: "RecipesStripeSync", key: :global
 
     def perform(account); end
   end
@@ -106,7 +106,7 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
   class SyncShopProductsJob < ApplicationJob
     coalesce key: ->(shop) { shop }
     limits_concurrency key: ->(shop) { shop }
-    limits_rate to: 2, per: 1.second, burst: 3, group: "RecipesShopify"
+    limits_rate to: 2, per: 1.second, burst: 3, group: "RecipesShopify", key: :global
 
     def perform(shop)
       JobBuffer.add(shop)

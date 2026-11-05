@@ -7,7 +7,7 @@ class RateLimitTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   class TenASecondJob < ApplicationJob
-    limits_rate to: 10, per: 1.second, burst: 3
+    limits_rate to: 10, per: 1.second, burst: 3, key: :global
 
     def perform(value)
       JobResult.create!(queue_name: "default", status: "limited", value: value)
@@ -24,7 +24,7 @@ class RateLimitTest < ActiveSupport::TestCase
   # A claim starts some time after that, so timing claims would misjudge the rate.
   module RecordAdmissions
     def admit(interval, burst, now)
-      super.tap { |admitted| (Thread.current[:rate_limit_test_admissions] ||= []) << now.to_r if admitted && key == TenASecondJob.name }
+      super.tap { |admitted| (Thread.current[:rate_limit_test_admissions] ||= []) << now.to_r if admitted && key == "#{TenASecondJob.name}/global" }
     end
   end
 

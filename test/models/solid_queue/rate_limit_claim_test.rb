@@ -6,7 +6,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   class LimitedJob < ApplicationJob
-    limits_rate to: 1, per: 10.seconds, burst: 2
+    limits_rate to: 1, per: 10.seconds, burst: 2, key: :global
 
     def perform(value)
       JobBuffer.add(value)
@@ -14,13 +14,13 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
   end
 
   class CasedJob < ApplicationJob
-    limits_rate to: 1, per: 10.seconds
+    limits_rate to: 1, per: 10.seconds, key: :global
 
     def perform; end
   end
 
   class CASEDJob < ApplicationJob
-    limits_rate to: 1, per: 10.seconds
+    limits_rate to: 1, per: 10.seconds, key: :global
 
     def perform; end
   end
@@ -81,7 +81,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
 
     claim(10)
 
-    assert_equal [ { class_name: LimitedJob.name, keys: [ LimitedJob.name ], job_ids: [ jobs.last.provider_job_id ], size: 1 } ], events
+    assert_equal [ { class_name: LimitedJob.name, keys: [ "#{LimitedJob.name}/global" ], job_ids: [ jobs.last.provider_job_id ], size: 1 } ], events
   ensure
     ActiveSupport::Notifications.unsubscribe(subscriber)
   end
@@ -149,7 +149,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     SolidQueue::Job.where(id: jobs.first.provider_job_id).update_all(class_name: "#{self.class.name}::RenamedLimitedJob")
 
     assert_equal provider_ids(jobs.first(2)), claim(10).map(&:job_id)
-    assert_equal [ LimitedJob.name ], SolidQueue::RateLimitState.pluck(:key)
+    assert_equal [ "#{LimitedJob.name}/global" ], SolidQueue::RateLimitState.pluck(:key)
   end
 
   test "a job the rate rejects wakes the next blocked job, which the claim can admit" do
@@ -388,7 +388,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     3.times { |i| LimitedJob.perform_later(i) }
     claim(10)
 
-    LimitedJob.with(rate_limit_to: nil) do
+    LimitedJob.with(rate_limit_key: nil) do
       2.times { |i| LimitedJob.perform_later(i) }
       assert_equal 2, claim(10).size
 
@@ -533,13 +533,13 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     assert_equal [ "SolidQueue::Pause Pluck", "TRANSACTION", "SolidQueue::ReadyExecution Load", "SolidQueue::ClaimedExecution Insert", "SolidQueue::ClaimedExecution Load", "SolidQueue::ReadyExecution Delete All", "TRANSACTION" ], queries
   end
 
-  test "a limited class without a key or a group claims with the same queries as 0.1.0" do
+  test "a claim reads the stored keys of limited jobs in one query" do
     3.times { |i| LimitedJob.perform_later(i) }
-    SolidQueue::RateLimitState.create!(key: LimitedJob.name, tat: Time.current)
+    SolidQueue::RateLimitState.create!(key: "#{LimitedJob.name}/global", tat: Time.current)
 
     queries = capture_queries { claim(10) }
 
-    assert_equal [ "SolidQueue::Pause Pluck", "TRANSACTION", "SolidQueue::ReadyExecution Load", "SolidQueue::Job Load", "SolidQueue::RateLimitState Pluck", "SolidQueue::RateLimitState Load", "SolidQueue::RateLimitState Update", "SolidQueue::ScheduledExecution Insert", "SolidQueue::ClaimedExecution Bulk Insert", "SolidQueue::ClaimedExecution Load", "SolidQueue::ReadyExecution Delete All", "SolidQueue::ReadyExecution Delete All", "TRANSACTION", "TRANSACTION", "SolidQueue::ReadyExecution Load", "TRANSACTION" ], queries
+    assert_equal [ "SolidQueue::Pause Pluck", "TRANSACTION", "SolidQueue::ReadyExecution Load", "SolidQueue::Job Load", "SolidQueue::Job Pluck", "SolidQueue::RateLimitState Pluck", "SolidQueue::RateLimitState Load", "SolidQueue::RateLimitState Update", "SolidQueue::ScheduledExecution Insert", "SolidQueue::ClaimedExecution Bulk Insert", "SolidQueue::ClaimedExecution Load", "SolidQueue::ReadyExecution Delete All", "SolidQueue::ReadyExecution Delete All", "TRANSACTION", "TRANSACTION", "SolidQueue::ReadyExecution Load", "TRANSACTION" ], queries
   end
 
   private

@@ -7,7 +7,7 @@ class SolidQueue::RateLimitPendingMigrationsTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   class LimitedJob < ApplicationJob
-    limits_rate to: 1, per: 1.minute, burst: 2
+    limits_rate to: 1, per: 1.minute, burst: 2, key: :global
 
     def perform(value)
       JobBuffer.add(value)
@@ -16,14 +16,14 @@ class SolidQueue::RateLimitPendingMigrationsTest < ActiveSupport::TestCase
 
   class CoalescedLimitedJob < ApplicationJob
     coalesce key: ->(value) { value }
-    limits_rate to: 1, per: 1.minute
+    limits_rate to: 1, per: 1.minute, key: :global
 
     def perform(value); end
   end
 
   class CollectingLimitedJob < ApplicationJob
     coalesce key: ->(value) { value }, on_conflict: :collect
-    limits_rate to: 1, per: 1.minute
+    limits_rate to: 1, per: 1.minute, key: :global
 
     def perform_calls(calls); end
   end

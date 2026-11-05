@@ -12,13 +12,13 @@ class SolidQueue::RateLimitKeyTest < ActiveSupport::TestCase
   end
 
   class ClassLimitedJob < ApplicationJob
-    limits_rate to: 1, per: 10.seconds
+    limits_rate to: 1, per: 10.seconds, key: :global
 
     def perform; end
   end
 
   class StripeChargeJob < ApplicationJob
-    limits_rate to: 1, per: 10.seconds, group: "Stripe"
+    limits_rate to: 1, per: 10.seconds, group: "Stripe", key: :global
 
     def perform(account); end
   end
@@ -28,7 +28,7 @@ class SolidQueue::RateLimitKeyTest < ActiveSupport::TestCase
   class StripeChargeChildJob < StripeChargeJob; end
 
   class StripeRefundJob < ApplicationJob
-    limits_rate to: 1, per: 10.seconds, group: :Stripe
+    limits_rate to: 1, per: 10.seconds, group: :Stripe, key: :global
 
     def perform(account); end
   end
@@ -157,9 +157,29 @@ class SolidQueue::RateLimitKeyTest < ActiveSupport::TestCase
   end
 
   test "a nil key in a group falls back to the group's budget" do
-    jobs = [ OptionalStripeAccountJob.perform_later(nil), StripeChargeJob.perform_later("a"), OptionalStripeAccountJob.perform_later("a") ]
+    jobs = [ OptionalStripeAccountJob.perform_later(nil), OptionalStripeAccountJob.perform_later(nil), OptionalStripeAccountJob.perform_later("a") ]
 
     assert_equal provider_ids([ jobs.first, jobs.third ]), claim.map(&:job_id)
+    assert_equal [ "Stripe", "Stripe/a" ], SolidQueue::RateLimitState.pluck(:key).sort
+  end
+
+  test "keys are built the way limits_concurrency builds its key" do
+    result = JobResult.create!
+
+    [ [ "literal", [] ], [ :literal, [] ], [ ->(name) { name }, [ "a" ] ], [ ->(record) { record }, [ result ] ], [ ->(*) { nil }, [] ], [ "", [] ], [ 42, [] ] ].each do |key, arguments|
+      [ {}, { group: "Stripe" }, { group: nil } ].each do |group|
+        job_class = Class.new(ApplicationJob) do
+          def self.name = "ParityJob"
+
+          limits_rate to: 1, per: 1.second, key: key, **group
+          limits_concurrency key: key, **group
+        end
+
+        assert_equal job_class.new(*arguments).concurrency_key, job_class.new(*arguments).rate_limit_key
+      end
+    end
+  ensure
+    JobResult.delete_all
   end
 
   test "a key and a group that are both nil fall back to the class's budget" do
@@ -209,30 +229,34 @@ class SolidQueue::RateLimitKeyTest < ActiveSupport::TestCase
     end
   end
 
-  test "a job enqueued before its class declared a key uses the class's budget" do
-    old = 2.times.map { PerAccountJob.with(rate_limit_key: nil) { PerAccountJob.perform_later("a") } }
+  test "a job enqueued without a key, as by 0.1.0, uses the class's budget" do
+    old = 2.times.map { PerAccountJob.perform_later("a") }
+    without_stored_keys(old)
     new = PerAccountJob.perform_later("a")
 
     assert_equal provider_ids([ old.first, new ]), claim.map(&:job_id)
+    assert_equal [ PerAccountJob.name, "#{PerAccountJob.name}/a" ], SolidQueue::RateLimitState.pluck(:key).sort
   end
 
-  test "a class that stops declaring a key or a group sends its waiting jobs to the class's budget" do
+  test "a job without a key gets its class's current key when it's serialized again" do
+    job = PerAccountJob.new("a")
+    job.deserialize(job.serialize.except(ActiveJob::RateControls::RATE_LIMIT_KEY))
+
+    assert_equal "#{PerAccountJob.name}/a", job.serialize[ActiveJob::RateControls::RATE_LIMIT_KEY]
+  end
+
+  test "a waiting job keeps the key it was enqueued with when its class changes the key" do
     PerAccountJob.perform_later("a")
     PerAccountJob.perform_later("b")
-    StripeChargeJob.perform_later("a")
 
-    PerAccountJob.with(rate_limit_key: nil) do
-      StripeChargeJob.with(rate_limit_group: nil) do
-        assert_equal [ PerAccountJob.name, StripeChargeJob.name ], claim.map { |execution| execution.job.class_name }
-      end
-    end
+    PerAccountJob.with(rate_limit_key: :global) { assert_equal 2, claim.size }
   end
 
-  test "a class that drops its limit has its keyed jobs claimed" do
+  test "a class that turns its limit off has its jobs claimed" do
     PerAccountJob.perform_later("a")
     PerAccountJob.perform_later("a")
 
-    PerAccountJob.with(rate_limit_to: nil) { assert_equal 2, claim.size }
+    PerAccountJob.with(rate_limit_key: nil) { assert_equal 2, claim.size }
   end
 
   test "a retry from retry_on keeps its key" do
@@ -269,14 +293,14 @@ class SolidQueue::RateLimitKeyTest < ActiveSupport::TestCase
     assert_equal [ "b" ], claim.map { |execution| execution.job.arguments["arguments"].sole }
   end
 
-  test "a claim reads the stored keys of keyed jobs only, in one query" do
-    keyed = [ PerAccountJob.perform_later("a"), StripeChargeJob.perform_later("b") ]
-    others = [ ClassLimitedJob.perform_later, AddToBufferJob.perform_later("unlimited") ]
+  test "a claim reads the stored keys of limited jobs only, in one query" do
+    limited = [ PerAccountJob.perform_later("a"), StripeChargeJob.perform_later("b"), ClassLimitedJob.perform_later ]
+    unlimited = [ AddToBufferJob.perform_later("unlimited") ]
 
     # Payloads that can't be parsed fail any claim that reads them
-    SolidQueue::Job.where(id: provider_ids(others)).update_all("arguments = '{'")
+    SolidQueue::Job.where(id: provider_ids(unlimited)).update_all("arguments = '{'")
 
-    queries = capture_queries { assert_equal provider_ids(keyed + others).sort, claim.map(&:job_id).sort }
+    queries = capture_queries { assert_equal provider_ids(limited + unlimited).sort, claim.map(&:job_id).sort }
 
     assert_equal 1, queries.count("SolidQueue::Job Pluck")
   end
@@ -297,6 +321,12 @@ class SolidQueue::RateLimitKeyTest < ActiveSupport::TestCase
       queries
     ensure
       ActiveSupport::Notifications.unsubscribe(subscriber)
+    end
+
+    def without_stored_keys(active_jobs)
+      SolidQueue::Job.where(id: provider_ids(active_jobs)).each do |job|
+        job.update!(arguments: job.arguments.except(ActiveJob::RateControls::RATE_LIMIT_KEY))
+      end
     end
 
     def rate_limited_job(name, **options)

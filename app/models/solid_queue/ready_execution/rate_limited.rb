@@ -73,12 +73,10 @@ module SolidQueue
             next_checks
           end
 
-          # Returns each candidate's key. Only a class that declares key: or group: stores
-          # one with its jobs, so only theirs are read. Otherwise the key is the class's name,
-          # which a job enqueued under an alias, or before its class declared a key, shares.
+          # Returns each candidate's key, stored with its job at enqueue. A job without one,
+          # enqueued before its class declared a limit or by 0.1.0, uses the class's name.
           def rate_limit_keys(executions, jobs, job_classes)
-            keyed = executions.select { |execution| job_classes[jobs[execution.job_id].class_name].rate_limit_keyed? }
-            stored = keyed.any? ? Job.where(id: keyed.map(&:job_id)).pluck(:id, :arguments).to_h { |id, arguments| [ id, arguments[ActiveJob::RateControls::RATE_LIMIT_KEY] ] } : {}
+            stored = Job.where(id: executions.map(&:job_id)).pluck(:id, :arguments).to_h { |id, arguments| [ id, arguments[ActiveJob::RateControls::RATE_LIMIT_KEY] ] }
 
             executions.index_with { |execution| stored[execution.job_id] || job_classes[jobs[execution.job_id].class_name].name }
           end

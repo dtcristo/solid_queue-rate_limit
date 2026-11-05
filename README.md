@@ -9,7 +9,7 @@ Solid Queue Rate Limit adds `limits_rate` to Active Job classes. Workers claim a
 
 ```ruby
 class SyncStripeJob < ApplicationJob
-  limits_rate to: 100, per: 1.minute, burst: 10
+  limits_rate to: 100, per: 1.minute, burst: 10, key: :global
 
   def perform(account_id)
     Account.find(account_id).sync_to_stripe!
@@ -99,7 +99,7 @@ Use this when an API allows a number of calls in any minute and you want to stay
 ```ruby
 class SyncStripeCustomerJob < ApplicationJob
   # At most 10 + 90 = 100 claims in any minute
-  limits_rate to: 90, per: 1.minute, burst: 10
+  limits_rate to: 90, per: 1.minute, burst: 10, key: :global
 
   def perform(account_id)
     Account.find(account_id).sync_to_stripe!
@@ -116,7 +116,7 @@ Use this when an API wants a gap between calls, and two calls close together wou
 ```ruby
 class GeocodeAddressJob < ApplicationJob
   # The default burst: 1 never claims two jobs less than 5 seconds apart
-  limits_rate to: 1, per: 5.seconds
+  limits_rate to: 1, per: 5.seconds, key: :global
 
   def perform(address_id)
     Address.find(address_id).geocode!
@@ -133,7 +133,7 @@ Use this when a backlog builds up and has to drain at the declared rate.
 ```ruby
 class SendWebhookJob < ApplicationJob
   # 5 × (1 + 0.1) / 1 = 5.5, rounded up, for the default 1-second dispatcher poll and 0.1-second worker poll
-  limits_rate to: 5, per: 1.second, burst: 6
+  limits_rate to: 5, per: 1.second, burst: 6, key: :global
 
   def perform(webhook_id)
     Webhook.find(webhook_id).deliver!
@@ -141,7 +141,7 @@ class SendWebhookJob < ApplicationJob
 end
 ```
 
-If 6 jobs at once is too many for the API, make the dispatcher poll more often instead. With a 0.2-second poll, `5 × (0.2 + 0.1) / 1 = 1.5`, which rounds up to 2, so `limits_rate to: 5, per: 1.second, burst: 2` is enough:
+If 6 jobs at once is too many for the API, make the dispatcher poll more often instead. With a 0.2-second poll, `5 × (0.2 + 0.1) / 1 = 1.5`, which rounds up to 2, so `limits_rate to: 5, per: 1.second, burst: 2, key: :global` is enough:
 
 ```yaml
 # config/queue.yml
@@ -168,7 +168,7 @@ class SyncShopOrdersJob < ApplicationJob
 end
 ```
 
-`key:` gets the job's arguments, as in `limits_concurrency`. A record becomes its class name and id, so the shop with id 42 gets a budget of its own, stored under `SyncShopOrdersJob/Shop/42`. A Proc that returns `nil` sends the job to the class's budget. `burst: 3` follows the [backlog rule](#picking-a-burst-for-a-backlog), and applies to each shop.
+`key:` gets the job's arguments, as in `limits_concurrency`. A record becomes its class name and id, so the shop with id 42 gets a budget of its own, stored under `SyncShopOrdersJob/Shop/42`. A Proc that returns `nil` sends the job to the class's bare budget, `SyncShopOrdersJob`. `burst: 3` follows the [backlog rule](#picking-a-burst-for-a-backlog), and applies to each shop.
 
 ### Share a budget between classes
 
@@ -176,7 +176,7 @@ Use this when several job classes call one API, and together they have to stay u
 
 ```ruby
 class SyncStripeCustomerJob < ApplicationJob
-  limits_rate to: 90, per: 1.minute, burst: 10, group: "Stripe"
+  limits_rate to: 90, per: 1.minute, burst: 10, group: "Stripe", key: :global
 
   def perform(account_id)
     Account.find(account_id).sync_to_stripe!
@@ -184,7 +184,7 @@ class SyncStripeCustomerJob < ApplicationJob
 end
 
 class RefundStripeChargeJob < ApplicationJob
-  limits_rate to: 90, per: 1.minute, burst: 10, group: "Stripe"
+  limits_rate to: 90, per: 1.minute, burst: 10, group: "Stripe", key: :global
 
   def perform(charge_id)
     Charge.find(charge_id).refund!
@@ -192,7 +192,7 @@ class RefundStripeChargeJob < ApplicationJob
 end
 ```
 
-Both classes draw on one budget, stored under `Stripe`. Declare the same limit in every class of a group, because each job is charged with its own class's settings. See [Rules and limitations](#rules-and-limitations).
+Both classes draw on one budget, stored under `Stripe/global`. Declare the same limit in every class of a group, because each job is charged with its own class's settings. See [Rules and limitations](#rules-and-limitations).
 
 ### Share a budget for each account between classes
 
@@ -226,7 +226,7 @@ Use this when two syncs for one account mustn't run at once, and all accounts to
 class SyncStripeAccountJob < ApplicationJob
   # One sync at a time for each account, and at most 10 + 100 claims in any minute across all of them
   limits_concurrency key: ->(account) { account }
-  limits_rate to: 100, per: 1.minute, burst: 10, group: "Stripe"
+  limits_rate to: 100, per: 1.minute, burst: 10, group: "Stripe", key: :global
 
   def perform(account)
     account.sync_to_stripe!
@@ -245,7 +245,7 @@ class SyncShopProductsJob < ApplicationJob
   # One pending and one running sync for each shop, and at most 3 + 2 claims in any second across them
   coalesce key: ->(shop) { shop }
   limits_concurrency key: ->(shop) { shop }
-  limits_rate to: 2, per: 1.second, burst: 3, group: "Shopify"
+  limits_rate to: 2, per: 1.second, burst: 3, group: "Shopify", key: :global
 
   def perform(shop)
     shop.sync_products!
@@ -300,7 +300,7 @@ Unlimited jobs keep running. Only limited jobs move to scheduled executions, and
 
 The limit counts claims at the worker gate, the moment a worker takes a job from `solid_queue_ready_executions`. It doesn't count job starts, finishes or the API calls a job makes.
 
-With `T = per / to`, in any window of `w` seconds, workers claim at most `burst + floor(w / T)` of the jobs that share a budget. With `burst: 1` that's even spacing, at least `T` apart. With a larger burst it isn't an exact rolling-window quota. `limits_rate to: 100, per: 1.minute, burst: 10` allows 110 claims in a minute that follows a quiet spell.
+With `T = per / to`, in any window of `w` seconds, workers claim at most `burst + floor(w / T)` of the jobs that share a budget. With `burst: 1` that's even spacing, at least `T` apart. With a larger burst it isn't an exact rolling-window quota. `limits_rate to: 100, per: 1.minute, burst: 10, key: :global` allows 110 claims in a minute that follows a quiet spell.
 
 Some things fall outside it:
 
@@ -342,8 +342,8 @@ These numbers come from 30 to 60 waiting jobs, with one worker polling every 0.1
 - The limit counts claims, not API calls, and isn't an exact rolling-window quota once `burst` is above 1. See [What the limit guarantees](#what-the-limit-guarantees).
 - With `burst: 1`, a backlog drains slower than the rate. See [Picking a burst for a backlog](#picking-a-burst-for-a-backlog).
 - A waiting job is a scheduled job with its own `scheduled_at` kept, and checks again at most 5 minutes later. See [How waiting works](#how-waiting-works).
-- Each job class has its own budget, and so does each subclass, unless it declares `key:` or `group:`. See [Rules and limitations](#rules-and-limitations).
-- When the app is eager-loaded and no class declares `limits_rate`, claims run exactly Solid Queue's queries. Otherwise each claim reads the class names of the jobs it locked, and locks one row per budget. When some of those jobs' classes declare `key:` or `group:`, it reads their keys too, in one more query. When it defers jobs that hold a concurrency slot, it loads them, gives their concurrency slots back and wakes the next blocked job for each.
+- Each job class has its own budgets, and so does each subclass, unless it declares `group:`. See [Rules and limitations](#rules-and-limitations).
+- When the app is eager-loaded and no class declares `limits_rate`, claims run exactly Solid Queue's queries. Otherwise each claim reads the class names of the jobs it locked, reads the limited jobs' keys in one more query, and locks one row per budget. When it defers jobs that hold a concurrency slot, it loads them, gives their concurrency slots back and wakes the next blocked job for each.
 
 ## Clearing idle budgets
 
@@ -381,18 +381,33 @@ CI runs Ruby 3.2, 3.3, 3.4 and 4.0 against all three databases.
 ## `limits_rate` options
 
 ```ruby
-limits_rate to:, per:, burst: 1, key: nil, group: nil
+limits_rate to:, per:, key:, burst: 1, group: ->(*) { self.class.name }
 ```
 
 - `to` is required, and is a positive integer: how many jobs a `per` admits.
 - `per` is required, and is a positive duration. Workers admit jobs `per / to` apart, which has to be at least 1 millisecond.
+- `key` is required, and identifies the jobs that share a budget, as in `limits_concurrency`.
 - `burst` is a positive integer, 1 by default: how many jobs a quiet budget admits at once.
-- `key` splits the budget, so each value gets one of its own. It's a String or Symbol, used as it is, or a Proc that gets the job's arguments. A Proc can return a record, which becomes its class name and id. A Proc that returns `nil` sends the job to the group's budget, or the class's.
 - `group` shares the budget with every class that names the same group. It takes the same values as `key`. Without it, the budget belongs to the class.
 
-`key` and `group` work like the ones `limits_concurrency` takes, and the gem builds a budget's key the way Solid Queue builds a concurrency key: the group, or the class's name, then the key's value, joined with `/`. Another type of value counts as `nil`, as it does there.
+`key` and `group` work like the ones `limits_concurrency` takes, and the gem builds a budget's key the way Solid Queue builds a concurrency key: the group, or the class's name, then the key's value, joined with `/`.
 
-An invalid `to`, `per` or `burst` raises `ArgumentError` when the class loads. The class gets `rate_limit_to`, `rate_limit_per`, `rate_limit_burst`, `rate_limit_key`, `rate_limit_group` and `rate_limited?` to read them back.
+```ruby
+limits_rate to: 1, per: 1.second, key: :global                                       # Literal class-wide key: JobClass/global
+limits_rate to: 1, per: 1.second, key: "global"                                      # Same literal component
+limits_rate to: 1, per: 1.second, key: ->(account_id) { account_id }                 # Distinct per account
+limits_rate to: 1, per: 1.second, key: ->(account) { account }                       # Active Record class and ID
+limits_rate to: 1, per: 1.second, key: ->(account_id, kind) { [ account_id, kind ] } # Composite key
+```
+
+- A Symbol or String is a literal. `key: :account_id` doesn't read a parameter called `account_id`.
+- A Proc receives the job's arguments.
+- The result is joined into a string, so `1` and `"1"` give the same key.
+- An array's items are joined with `/`, so `[ "a/b" ]` and `[ "a", "b" ]` give the same key.
+- A Proc that returns `nil` gives the bare class-wide key, `JobClass`, or the group's, so all of those jobs share a budget.
+- A declaration of `nil` or `false` disables the limit, as it disables `limits_concurrency`, so `key: nil` isn't a class-wide key. For one key per class, use a literal such as `:global`, or a Proc that returns `nil`. Other unsupported declaration types, such as `key: 123`, give the class-wide key.
+
+Except for `key:`, an invalid option raises `ArgumentError` when the class loads. The class gets `rate_limit_to`, `rate_limit_per`, `rate_limit_burst`, `rate_limit_key`, `rate_limit_group` and `rate_limited?` to read them back.
 
 The key is computed once, when Solid Queue enqueues the job, and stored with it, so a claim never deserializes arguments or loads records. A key Proc that raises fails the enqueue. `perform_now` and other adapters never run it.
 
@@ -401,14 +416,14 @@ Changing a limit and deploying applies to the next claim. A looser limit doesn't
 ## Rules and limitations
 
 - A class has one limit. A second `limits_rate` in the same class raises `ArgumentError`. `name:`, for multiple limits, raises `ArgumentError` until [#14](https://github.com/dtcristo/solid_queue-rate_limit/issues/14).
-- A subclass inherits its parent's limit, `key:` and `group:`. Without a group, it has a budget of its own, so declaring `limits_rate` on `ApplicationJob` gives each job class its own budget, not one shared between them. A subclass can redeclare the limit, and then has only the `key:` and `group:` it declares.
+- A subclass inherits its parent's limit, `key:` and `group:`. Without a group, it has budgets of its own, so declaring `limits_rate` on `ApplicationJob` gives each job class its own budget, not one shared between them. A subclass can redeclare the limit, and then has only the `key:` and `group:` it declares. Redeclaring with `key: nil` turns the limit off.
 - Every class in a group has to declare the same `to:`, `per:` and `burst:`. The gem doesn't check, as Solid Queue doesn't for concurrency groups. Each job is charged with its own class's settings against the shared budget, so with mixed settings a group can admit more than the stricter one allows.
 - Keys aren't escaped, as concurrency keys aren't. A group named after a job class shares that class's budget, and `group: "Stripe", key: "a/b"` shares one with `group: "Stripe/a", key: "b"`. On MySQL, whose default collation ignores case, keys that differ only in case share one budget.
 - A key longer than `solid_queue_rate_limits.key` allows, 255 characters on MySQL, raises `ActiveRecord::ValueTooLong` at enqueue, as an over-long concurrency key does. `perform_later` raises it wrapped in `SolidQueue::Job::EnqueueError`, and `perform_all_later` raises it as it is. PostgreSQL and SQLite have no limit.
 - A retry keeps the key its job was enqueued with. That covers a `retry_on` retry, a failed job you retry, and a retry after the arguments failed to deserialize.
-- A job enqueued before its class declared `key:` or `group:`, or still waiting after the class stops declaring them, uses the class's budget.
+- A job keeps the key it was enqueued with while it waits, even if its class changes `key:` or `group:`. A job enqueued without a key, before its class declared a limit or by 0.1.0, uses the bare class-wide budget, `JobClass`, and gets the current key if it's retried.
 - `limits_rate` combines with `limits_concurrency`, in either order and through inheritance. A job over the rate gives its concurrency slot back and wakes the next blocked job for its key once the claim commits, and takes one again when the dispatcher brings it back, or is blocked. `limits_concurrency` with `on_conflict: :discard` raises `ArgumentError` with `limits_rate`, because a job that came back to a taken concurrency slot would be discarded. A job that still has a concurrency key after its class dropped `limits_concurrency` is checked like any other.
-- Without `key:` or `group:`, the budget is stored under the class's name. A job enqueued under an alias, such as a constant kept after a rename, shares the class's budget. On MySQL, two classes whose names differ only in case share one budget.
+- Without `group:`, the budget's key starts with the class's name. A job enqueued under an alias, such as a constant kept after a rename, keeps the key it was enqueued with, and shares the class's budget. On MySQL, two classes whose names differ only in case share one budget.
 - A job whose class doesn't load, or whose `class_name` isn't a job class, is claimed without a check and fails as it would without the gem.
 - A class that drops its limit has its waiting jobs claimed when they next check, at most 5 minutes later.
 
