@@ -78,10 +78,15 @@ module SolidQueue
           # and let a second job with its key run. It takes one again when it's dispatched.
           # Going through them by concurrency key, as dispatch_all_one_by_one does, makes
           # claims that release the same semaphores take them in the same order.
+          #
+          # This is Job#unblock_next_blocked_job, with the wake in a savepoint of its own,
+          # so a wake that fails doesn't take the release back with it.
           def release_concurrency_locks(job_ids)
             if job_ids.any?
               Job.where(id: job_ids).sort_by { |job| [ job.concurrency_key, job.id ] }.each do |job|
-                transaction(requires_new: true) { job.unblock_next_blocked_job }
+                if job.send(:release_concurrency_lock)
+                  transaction(requires_new: true) { BlockedExecution.release_one(job.concurrency_key) }
+                end
               rescue ActiveRecord::ActiveRecordError
                 raise
               rescue StandardError, ScriptError => error

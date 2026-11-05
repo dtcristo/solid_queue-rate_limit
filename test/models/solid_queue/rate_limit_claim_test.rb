@@ -287,7 +287,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     assert_equal 1, SolidQueue::Semaphore.sole.value
   end
 
-  test "a blocked job whose class raises when it loads stays blocked, and the claim goes on" do
+  test "a blocked job whose class raises when it loads stays blocked, and the claim gives the semaphore back and goes on" do
     spend_budget_of("a")
     SyncAccountJob.perform_later("a")
     broken = SyncAccountJob.perform_later("b")
@@ -299,6 +299,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
 
     assert_equal [ unlimited.provider_job_id ], claimed.map(&:job_id)
     assert_equal [ broken.provider_job_id ], SolidQueue::BlockedExecution.pluck(:job_id)
+    assert_equal 1, SolidQueue::Semaphore.sole.value
     assert_match(/SyntaxError: broken/, log.string)
   end
 
