@@ -60,6 +60,27 @@ module SolidQueue
           end
       end
 
+      # A claim that defers jobs inserts scheduled executions while it holds ready ones,
+      # and the dispatcher inserts ready executions while it holds scheduled ones, so on
+      # MySQL the two can deadlock. The dispatcher doesn't rescue errors, and would stop,
+      # so a deadlocked batch runs once more.
+      module Dispatching
+        def dispatch_next_batch(batch_size)
+          return super unless RateLimit.enforced? && !connection_pool.with_connection(&:transaction_open?)
+
+          retried = false
+
+          begin
+            super
+          rescue ActiveRecord::Deadlocked
+            raise if retried
+
+            retried = true
+            retry
+          end
+        end
+      end
+
       # Prepended rather than added to the adapter, because RecurringTask calls
       # Job.enqueue directly. A limited job can't be admitted without the schema,
       # so it's better to find out when it's enqueued.
@@ -84,6 +105,7 @@ module SolidQueue
         SolidQueue::Job.singleton_class.prepend Enqueuing
         SolidQueue::ReadyExecution.include SolidQueue::ReadyExecution::RateLimited
         SolidQueue::ReadyExecution.singleton_class.prepend Claiming
+        SolidQueue::ScheduledExecution.singleton_class.prepend Dispatching
       end
     end
   end

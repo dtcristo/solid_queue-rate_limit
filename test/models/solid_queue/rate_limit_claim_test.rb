@@ -257,6 +257,29 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     assert_equal 0, SolidQueue::RateLimitState.count
   end
 
+  test "a deadlock in a dispatch rolls it back and dispatches once more" do
+    jobs = 2.times.map { |i| LimitedJob.set(wait: 1.minute).perform_later(i) }
+    travel 1.minute
+
+    dispatched = deadlocking_on(/\ASolidQueue::ReadyExecution (Bulk )?Insert\z/, occurrence: 1) { SolidQueue::ScheduledExecution.dispatch_next_batch(10) }
+
+    assert_equal 2, dispatched
+    assert_equal provider_ids(jobs).sort, SolidQueue::ReadyExecution.pluck(:job_id).sort
+    assert SolidQueue::ScheduledExecution.none?
+  end
+
+  test "a second deadlock in a dispatch raises and rolls it back" do
+    2.times { |i| LimitedJob.set(wait: 1.minute).perform_later(i) }
+    travel 1.minute
+
+    assert_raises(ActiveRecord::Deadlocked) do
+      deadlocking_on(/\ASolidQueue::ReadyExecution (Bulk )?Insert\z/, occurrence: 1..2) { SolidQueue::ScheduledExecution.dispatch_next_batch(10) }
+    end
+
+    assert SolidQueue::ReadyExecution.none?
+    assert_equal 2, SolidQueue::ScheduledExecution.count
+  end
+
   test "classes whose names differ only in case can be claimed together" do
     jobs = [ CasedJob.perform_later, CASEDJob.perform_later ]
 
@@ -290,7 +313,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     def deadlocking_on(query_name, occurrence:, &block)
       seen = 0
       subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
-        raise ActiveRecord::Deadlocked, "Deadlock found" if payload[:name] == query_name && Array(occurrence).include?(seen += 1)
+        raise ActiveRecord::Deadlocked, "Deadlock found" if query_name === payload[:name] && Array(occurrence).include?(seen += 1)
       end
       block.call
     ensure
