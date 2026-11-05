@@ -230,7 +230,7 @@ class SyncStripeAccountJob < ApplicationJob
 end
 ```
 
-Solid Queue gives each account one slot, and the gem checks the rate when a worker claims the job. A job over the rate gives its slot back while it waits, so the account's next blocked job can take it, and takes a slot again when it comes back. If the slot is taken by then, the job is blocked, as any job would be. `limits_concurrency` with `on_conflict: :discard` can't be combined with `limits_rate`, because a job that came back to a taken slot would be discarded.
+Solid Queue gives each account one concurrency slot, and the gem checks the rate when a worker claims the job. A job over the rate gives its concurrency slot back while it waits, so the account's next blocked job can take it, and takes one again when it comes back. If there's none free by then, the job is blocked, as any job would be. `limits_concurrency` with `on_conflict: :discard` can't be combined with `limits_rate`, because a job that came back to a taken concurrency slot would be discarded.
 
 ## How waiting works
 
@@ -290,7 +290,7 @@ These numbers come from 30 to 60 waiting jobs, with one worker polling every 0.1
 - With `burst: 1`, a backlog drains slower than the rate. See [Picking a burst for a backlog](#picking-a-burst-for-a-backlog).
 - A waiting job is a scheduled job with its own `scheduled_at` kept, and checks again at most 5 minutes later. See [How waiting works](#how-waiting-works).
 - Each job class has its own budget, and so does each subclass, unless it declares `key:` or `group:`. See [Rules and limitations](#rules-and-limitations).
-- When the app is eager-loaded and no class declares `limits_rate`, claims run exactly Solid Queue's queries. Otherwise each claim reads the class names of the jobs it locked, and locks one row per budget. When some of those jobs' classes declare `key:` or `group:`, it reads their keys too, in one more query. When it defers jobs that hold a concurrency slot, it loads them, gives their slots back and wakes the next blocked job for each.
+- When the app is eager-loaded and no class declares `limits_rate`, claims run exactly Solid Queue's queries. Otherwise each claim reads the class names of the jobs it locked, and locks one row per budget. When some of those jobs' classes declare `key:` or `group:`, it reads their keys too, in one more query. When it defers jobs that hold a concurrency slot, it loads them, gives their concurrency slots back and wakes the next blocked job for each.
 
 ## Clearing idle budgets
 
@@ -353,7 +353,7 @@ Changing a limit and deploying applies to the next claim. A looser limit doesn't
 - A key longer than `solid_queue_rate_limits.key` allows, 255 characters on MySQL, raises `ActiveRecord::ValueTooLong` at enqueue, as an over-long concurrency key does. `perform_later` raises it wrapped in `SolidQueue::Job::EnqueueError`, and `perform_all_later` raises it as it is. PostgreSQL and SQLite have no limit.
 - A retry keeps the key its job was enqueued with. That covers a `retry_on` retry, a failed job you retry, and a retry after the arguments failed to deserialize.
 - A job enqueued before its class declared `key:` or `group:`, or still waiting after the class stops declaring them, uses the class's budget.
-- `limits_rate` combines with `limits_concurrency`, in either order and through inheritance. A job over the rate gives its concurrency slot back and wakes the next blocked job for its key, in the claim's transaction, and takes a slot again when the dispatcher brings it back. `limits_concurrency` with `on_conflict: :discard` raises `ArgumentError` with `limits_rate`, because a job that came back to a taken slot would be discarded. A job that still has a concurrency key after its class dropped `limits_concurrency` is checked like any other.
+- `limits_rate` combines with `limits_concurrency`, in either order and through inheritance. A job over the rate gives its concurrency slot back and wakes the next blocked job for its key, in the claim's transaction, and takes one again when the dispatcher brings it back, or is blocked. `limits_concurrency` with `on_conflict: :discard` raises `ArgumentError` with `limits_rate`, because a job that came back to a taken concurrency slot would be discarded. A job that still has a concurrency key after its class dropped `limits_concurrency` is checked like any other.
 - Without `key:` or `group:`, the budget is stored under the class's name. A job enqueued under an alias, such as a constant kept after a rename, shares the class's budget. On MySQL, two classes whose names differ only in case share one budget.
 - A job whose class doesn't load, or whose `class_name` isn't a job class, is claimed without a check and fails as it would without the gem.
 - A class that drops its limit has its waiting jobs claimed when they next check, at most 5 minutes later.
