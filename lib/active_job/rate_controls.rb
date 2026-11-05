@@ -45,7 +45,8 @@ module ActiveJob
       #   end
       #
       # A subclass inherits the limit, key and group. Without a group it has its own
-      # budget, and it can redeclare the limit. An invalid option raises +ArgumentError+.
+      # budget, and it can redeclare the limit. Except for +:key+, an invalid option raises
+      # +ArgumentError+.
       # +perform_now+ and other adapters don't enforce it, and never compute the key.
       def limits_rate(to:, per:, key:, burst: 1, group: DEFAULT_RATE_LIMIT_GROUP, **options)
         if options.key?(:name)
