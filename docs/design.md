@@ -177,6 +177,8 @@ The lock order rules out cycles on the state rows, except for a row `lock_all` i
 
 Each refill pass rescues `ActiveRecord::Deadlocked`. A deadlock on the first pass rolls it back, and the pass runs once more. With `key:`, claims insert new budgets' rows often, and on MySQL two claims inserting the same row can deadlock. Solid Queue's poller doesn't rescue errors, so raising would stop the worker until the supervisor replaces it. A second deadlock on the first pass raises. A deadlock on a later pass rolls back only that pass, and the claim returns what earlier passes committed.
 
+A claim that defers jobs inserts scheduled executions while it holds ready ones, and the dispatcher inserts ready executions while it holds scheduled ones. On MySQL the two take gap locks in opposite orders and can deadlock, which the concurrency test shows under load. The dispatcher's poll doesn't rescue errors either, so `dispatch_next_batch` rescues `ActiveRecord::Deadlocked` and runs the batch once more, and a second deadlock raises. Inside an outer transaction neither retries, because a deadlock aborts the whole transaction.
+
 ## Clearing idle budgets
 
 `SolidQueue::RateLimitState.clear_idle_in_batches(batch_size: 500, sleep_between_batches: 0)` has the shape of Solid Queue's `clear_finished_in_batches`. It deletes up to `batch_size` idle rows at a time until a batch deletes none. Nothing calls it. The README suggests a recurring task.
@@ -243,7 +245,6 @@ A dispatcher poll also makes about `to × polling_interval / per` jobs due at on
 
 - Capped staggering on a large, slow backlog isn't stress-tested. With 10,000 jobs at 1 per minute, 5 jobs hold slots and the rest come back every 5 minutes, about 33 dispatches and deferrals a second for nothing.
 - On Rails 7.x, SQLite transactions are DEFERRED, so a claim starts as a reader and upgrades to a writer. The dummy app opens IMMEDIATE transactions on every Rails version, so the suite has never run claims on Rails 7.x's default.
-- On MySQL, a claim's scheduled inserts and the dispatcher's ready inserts could take gap locks that deadlock each other. Testing hasn't shown it. A deadlock on a claim's first pass runs the pass once more, and a second one raises.
 - On PostgreSQL, the cleanup's `DELETE` locks rows in scan order, not key order, so it can deadlock with a claim that holds several keys. One of them is rolled back, and the cleanup runs again at its next schedule. Testing hasn't shown it.
 - With `burst: 1`, a backlog drains at about half to nine tenths of the rate. See [Throughput with a small burst](#throughput-with-a-small-burst). [#6](https://github.com/dtcristo/solid_queue-rate_limit/issues/6) is the place to change that.
 
@@ -256,6 +257,6 @@ A dispatcher poll also makes about `to × polling_interval / per` jobs due at on
 | Admission, deferral and scheduling | `app/models/solid_queue/ready_execution/rate_limited.rb` | `defer_rate_limited`, `rate_limit_keys`, `check_rate_limits`, `schedule_rate_limited`, `rate_limited_job_class` |
 | GCRA and slots | `app/models/solid_queue/rate_limit_state.rb` | `lock_all`, `admit`, `defer`, `MAX_DEFERRAL`, `PendingMigrations` |
 | Clearing idle budgets | `app/models/solid_queue/rate_limit_state.rb` | `clear_idle_in_batches`, `idle`, `lock_one` |
-| Every place the gem reaches into Solid Queue | `lib/solid_queue/rate_limit/patches.rb` | `Claiming`, `Enqueuing`, `MAX_CLAIM_PASSES`, the log subscriber |
+| Every place the gem reaches into Solid Queue | `lib/solid_queue/rate_limit/patches.rb` | `Claiming`, `Dispatching`, `Enqueuing`, `MAX_CLAIM_PASSES`, the log subscriber |
 | The fast path | `lib/solid_queue/rate_limit.rb` | `declared`, `enforced?` |
 | Table | `lib/generators/solid_queue/rate_limit/install/templates/db/create_solid_queue_rate_limits.rb` | |

@@ -16,7 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - `name:` still raises `ArgumentError`, and now links to [#14](https://github.com/dtcristo/solid_queue-rate_limit/issues/14), which tracks multiple limits. ([#19](https://github.com/dtcristo/solid_queue-rate_limit/pull/19))
-- A claim whose first pass deadlocks runs that pass once more instead of raising, so a deadlock no longer stops the worker. On MySQL, claims that insert a new budget's row at the same time can deadlock, which `key:` makes common. A second deadlock still raises. ([#19](https://github.com/dtcristo/solid_queue-rate_limit/pull/19))
+- A claim whose first pass deadlocks, or a dispatcher batch that deadlocks, runs once more instead of raising, so a deadlock no longer stops the worker or the dispatcher. On MySQL, claims that insert a new budget's row at the same time can deadlock, which `key:` makes common, and so can a claim that defers jobs and a dispatcher batch. A second deadlock still raises. ([#19](https://github.com/dtcristo/solid_queue-rate_limit/pull/19))
 
 ## [0.1.0] - 2026-11-04
 
