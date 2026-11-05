@@ -203,7 +203,7 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
   end
 
   test "the recurring task clears idle budgets and keeps the others" do
-    task = SolidQueue::RecurringTask.from_configuration("clear_solid_queue_rate_limits", command: "SolidQueue::RateLimitState.clear_idle_in_batches(sleep_between_batches: 0.3)", schedule: "every hour at minute 42")
+    task = SolidQueue::RecurringTask.from_configuration("clear_solid_queue_rate_limits", command: "SolidQueue::RateLimitState.clear_idle_in_batches(sleep_between_batches: 0.3)", schedule: "every hour at minute 27")
     ActiveJob.perform_all_later(%w[ a b ].map { |shop| PerShopJob.new(shop) })
     SolidQueue::ReadyExecution.claim("*", 500, @process.id)
     PerShopJob.perform_later("b")

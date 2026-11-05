@@ -280,7 +280,7 @@ A budget gets a row in `solid_queue_rate_limits` the first time a claim needs it
 ```yml
 clear_solid_queue_rate_limits:
   command: "SolidQueue::RateLimitState.clear_idle_in_batches(sleep_between_batches: 0.3)"
-  schedule: every hour at minute 42
+  schedule: every hour at minute 27
 ```
 
 It takes `batch_size:`, 500 by default, and `sleep_between_batches:`, like Solid Queue's `clear_finished_in_batches`.
