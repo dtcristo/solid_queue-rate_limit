@@ -56,6 +56,8 @@ class ActiveSupport::TestCase
     SolidQueue::ClaimedExecution.delete_all
     SolidQueue::FailedExecution.delete_all
     SolidQueue::RateLimitState.delete_all if SolidQueue::RateLimitState.migrated?
+    SolidQueue::CoalescedCall.delete_all
+    SolidQueue::CoalesceKey.delete_all
     JobResult.delete_all
   end
 

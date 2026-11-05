@@ -94,6 +94,25 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
     def perform(account); end
   end
 
+  class PushInventoryJob < ApplicationJob
+    coalesce key: ->(shop, _sku) { shop }, on_conflict: :collect, max_calls: 100
+    limits_rate to: 8, per: 1.minute, burst: 2, key: ->(shop, _sku) { shop }
+
+    def perform_calls(calls)
+      JobBuffer.add([ calls.first.arguments.first, calls.map { |call| call.arguments.last } ])
+    end
+  end
+
+  class SyncShopProductsJob < ApplicationJob
+    coalesce key: ->(shop) { shop }
+    limits_concurrency key: ->(shop) { shop }
+    limits_rate to: 2, per: 1.second, burst: 3, group: "RecipesShopify"
+
+    def perform(shop)
+      JobBuffer.add(shop)
+    end
+  end
+
   CLAIM_DELAYS = [ 0.08, 0.02, 0.05 ]
 
   setup do
@@ -219,6 +238,35 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
     assert_operator most_in_any(60, times), :<=, 100 + 10
     assert_operator times.max, :<=, (150 - 10) * 0.6 + 1.5
     claims.group_by(&:first).each_value { |claimed_together| assert_equal claimed_together.map(&:last).uniq, claimed_together.map(&:last) }
+  end
+
+  test "batched calls reach the bulk API in requests of at most max_calls, under the quota for each shop" do
+    calls = %w[ a b ].flat_map { |shop| Array.new(1000) { |sku| PushInventoryJob.new(shop, sku) } }
+    ActiveJob.perform_all_later(calls)
+
+    claims = run_dispatcher_and_worker(2.minutes) { |job_ids| first_arguments(job_ids) }
+    requests = JobBuffer.values
+
+    %w[ a b ].each do |shop|
+      times = claims.filter_map { |time, label| time if label == shop }
+      skus = requests.filter_map { |requested, batch| batch if requested == shop }
+
+      assert_equal 10, times.size
+      assert_operator most_in_any(60, times), :<=, 2 + 8
+      assert skus.all? { |batch| batch.size <= 100 }
+      assert_equal (0...1000).to_a, skus.flatten.sort
+    end
+  end
+
+  test "collapsed calls run once for each shop, and all shops stay under the global rate" do
+    ActiveJob.perform_all_later(%w[ a b c d e f g h ].flat_map { |shop| Array.new(20) { SyncShopProductsJob.new(shop) } })
+
+    times = run_dispatcher_and_worker(10.seconds)
+
+    assert_equal %w[ a b c d e f g h ], JobBuffer.values.sort
+    assert_operator most_in_any(1, times), :<=, 3 + 2
+    assert_operator times.max, :<=, (8 - 3) / 2.0 + 1.5
+    assert_equal 0, SolidQueue::Semaphore.where("value < 1").count
   end
 
   test "the recurring task clears idle budgets and keeps the others" do

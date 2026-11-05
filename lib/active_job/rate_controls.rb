@@ -111,10 +111,16 @@ module ActiveJob
     end
 
     # The key is computed once, when Solid Queue enqueues the job, and stored with it.
-    # A claim reads it without deserializing arguments, and a retry keeps it.
+    # A claim reads it without deserializing arguments, and a retry keeps it. Every
+    # path into Solid Queue serializes the job before writing it, including ones other
+    # gems add, so this is where a limited job finds out the schema is missing.
     def serialize # :nodoc:
-      if self.class.rate_limit_keyed? && self.class.queue_adapter_name == "solid_queue"
-        @rate_limit_key ||= rate_limit_key.presence&.tap { |key| ensure_rate_limit_key_fits(key) }
+      if self.class.rate_limited? && self.class.queue_adapter_name == "solid_queue"
+        raise SolidQueue::RateLimitState::PendingMigrations unless SolidQueue::RateLimitState.migrated?
+
+        if self.class.rate_limit_keyed?
+          @rate_limit_key ||= rate_limit_key.presence&.tap { |key| ensure_rate_limit_key_fits(key) }
+        end
       end
 
       @rate_limit_key ? super.merge(RATE_LIMIT_KEY => @rate_limit_key) : super
