@@ -34,6 +34,16 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     end
   end
 
+  # One at a time, with a budget for each account
+  class SyncAccountJob < ApplicationJob
+    limits_concurrency key: ->(*) { "all" }
+    limits_rate to: 1, per: 10.seconds, key: ->(account) { account }
+
+    def perform(account)
+      JobBuffer.add(account)
+    end
+  end
+
   # Not a job, whatever it says about itself
   class NotAJob
     def self.rate_limited?
@@ -142,12 +152,31 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     assert_equal [ LimitedJob.name ], SolidQueue::RateLimitState.pluck(:key)
   end
 
-  test "a job that still has a concurrency key is admitted without a rate check" do
+  test "a job that still has a concurrency key after its class dropped limits_concurrency is rate-checked" do
     jobs = 3.times.map { |i| LimitedJob.perform_later(i) }
     SolidQueue::Job.update_all(concurrency_key: "switched from limits_concurrency")
 
-    assert_equal provider_ids(jobs), claim(10).map(&:job_id)
-    assert_equal 0, SolidQueue::ScheduledExecution.count
+    assert_equal provider_ids(jobs.first(2)), claim(10).map(&:job_id)
+    assert_equal [ jobs.last.provider_job_id ], SolidQueue::ScheduledExecution.pluck(:job_id)
+  end
+
+  test "a job the rate admits keeps its semaphore" do
+    admitted = SyncAccountJob.perform_later("a")
+    blocked = SyncAccountJob.perform_later("b")
+
+    assert_equal [ admitted.provider_job_id ], claim(10).map(&:job_id)
+    assert_equal 0, SolidQueue::Semaphore.sole.value
+    assert_equal [ blocked.provider_job_id ], SolidQueue::BlockedExecution.pluck(:job_id)
+  end
+
+  test "a job the rate rejects gives its semaphore back and waits as a scheduled job" do
+    spend_budget_of("a")
+    deferred = SyncAccountJob.perform_later("a")
+    assert_equal 0, SolidQueue::Semaphore.sole.value
+
+    assert_empty claim(10)
+    assert_equal [ deferred.provider_job_id ], SolidQueue::ScheduledExecution.pluck(:job_id)
+    assert_equal 1, SolidQueue::Semaphore.sole.value
   end
 
   test "a class that dropped its limit has its jobs claimed, deferred ones included" do
@@ -328,6 +357,12 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
       queries
     ensure
       ActiveSupport::Notifications.unsubscribe(subscriber)
+    end
+
+    # Runs a job, which spends the account's budget and gives its slot back
+    def spend_budget_of(account)
+      SyncAccountJob.perform_later(account)
+      claim(10).each(&:perform)
     end
 
     def claim(limit)

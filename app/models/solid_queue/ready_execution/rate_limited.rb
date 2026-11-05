@@ -13,8 +13,7 @@ module SolidQueue
           jobs = Job.where(id: executions.map(&:job_id)).select(:id, :class_name, :queue_name, :priority, :concurrency_key).index_by(&:id)
           job_classes = jobs.values.map(&:class_name).uniq.index_with { |class_name| rate_limited_job_class(class_name) }.compact
 
-          # A job with a concurrency key holds its semaphore, so it can't wait here
-          limited = executions.select { |execution| (job = jobs[execution.job_id]) && job.concurrency_key.nil? && job_classes[job.class_name] }
+          limited = executions.select { |execution| (job = jobs[execution.job_id]) && job_classes[job.class_name] }
           return [] if limited.empty?
 
           keys = rate_limit_keys(limited, jobs, job_classes)
@@ -27,6 +26,7 @@ module SolidQueue
           end
 
           schedule_rate_limited(next_checks, jobs, keys)
+          release_concurrency_locks(next_checks.keys.map(&:job_id).select { |job_id| jobs[job_id].concurrency_key })
           next_checks.keys
         end
 
@@ -71,6 +71,16 @@ module SolidQueue
               next_checks.keys.group_by { |execution| jobs[execution.job_id].class_name }.each do |class_name, deferred|
                 SolidQueue.instrument(:defer_rate_limited, class_name: class_name, keys: keys.values_at(*deferred).uniq, job_ids: deferred.map(&:job_id), size: deferred.size)
               end
+            end
+          end
+
+          # A deferred job gives its semaphore back while it waits, so the semaphore can't expire
+          # and let a second job with its key run. It takes one again when it's dispatched.
+          # Going through them by concurrency key, as dispatch_all_one_by_one does, makes
+          # claims that release the same semaphores take them in the same order.
+          def release_concurrency_locks(job_ids)
+            if job_ids.any?
+              Job.where(id: job_ids).sort_by { |job| [ job.concurrency_key, job.id ] }.each(&:unblock_next_blocked_job)
             end
           end
 
