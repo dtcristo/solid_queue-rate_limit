@@ -406,6 +406,7 @@ limits_rate to: 1, per: 1.second, key: ->(account_id, kind) { [ account_id, kind
 - An array's items are joined with `/`, so `[ "a/b" ]` and `[ "a", "b" ]` give the same key.
 - A Proc that returns `nil` gives the bare class-wide key, `JobClass`, or the group's, so all of those jobs share a budget.
 - A declaration of `nil` or `false` disables the limit, as it disables `limits_concurrency`, so `key: nil` isn't a class-wide key. For one key per class, use a literal such as `:global`, or a Proc that returns `nil`. Other unsupported declaration types, such as `key: 123`, give the class-wide key.
+- A key that comes out blank, such as with `group: nil` and a Proc that returns `nil`, leaves the job unlimited, as a blank concurrency key does.
 
 Except for `key:`, an invalid option raises `ArgumentError` when the class loads. The class gets `rate_limit_to`, `rate_limit_per`, `rate_limit_burst`, `rate_limit_key`, `rate_limit_group` and `rate_limited?` to read them back.
 

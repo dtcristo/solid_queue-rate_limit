@@ -15,15 +15,14 @@ module SolidQueue
           job_classes = jobs.values.map(&:class_name).uniq.index_with { |class_name| rate_limited_job_class(class_name) }.compact
 
           limited = executions.select { |execution| (job = jobs[execution.job_id]) && job_classes[job.class_name] }
-          return [] if limited.empty?
-
-          keys = rate_limit_keys(limited, jobs, job_classes)
+          keys = limited.any? ? rate_limit_keys(limited, jobs, job_classes) : {}
+          return [] if keys.empty?
 
           next_checks = if RateLimitState.migrated?
             check_rate_limits(keys, jobs, job_classes)
           else
             log_pending_rate_limit_migrations
-            limited.to_h { |execution| [ execution, 1.minute.from_now ] }
+            keys.transform_values { 1.minute.from_now }
           end
 
           schedule_rate_limited(next_checks, jobs, keys)
@@ -74,11 +73,12 @@ module SolidQueue
           end
 
           # Returns each candidate's key, stored with its job at enqueue. A job without one,
-          # enqueued before its class declared a limit or by 0.1.0, uses the class's name.
+          # enqueued before its class declared a limit or by 0.1.0, uses the class's name. A
+          # blank key isn't limited, as a blank concurrency key isn't.
           def rate_limit_keys(executions, jobs, job_classes)
             stored = Job.where(id: executions.map(&:job_id)).pluck(:id, :arguments).to_h { |id, arguments| [ id, arguments[ActiveJob::RateControls::RATE_LIMIT_KEY] ] }
 
-            executions.index_with { |execution| stored[execution.job_id] || job_classes[jobs[execution.job_id].class_name].name }
+            executions.index_with { |execution| stored[execution.job_id] || job_classes[jobs[execution.job_id].class_name].name }.reject { |_, key| key.empty? }
           end
 
           def schedule_rate_limited(next_checks, jobs, keys)

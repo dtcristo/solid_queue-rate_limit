@@ -116,7 +116,7 @@ module ActiveJob
       if self.class.rate_limited? && self.class.queue_adapter_name == "solid_queue"
         raise SolidQueue::RateLimitState::PendingMigrations unless SolidQueue::RateLimitState.migrated?
 
-        @rate_limit_key ||= rate_limit_key.presence&.tap { |key| ensure_rate_limit_key_fits(key) }
+        @rate_limit_key ||= rate_limit_key.tap { |key| ensure_rate_limit_key_fits(key) }
       end
 
       @rate_limit_key ? super.merge(RATE_LIMIT_KEY => @rate_limit_key) : super

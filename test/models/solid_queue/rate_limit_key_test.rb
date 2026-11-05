@@ -182,12 +182,14 @@ class SolidQueue::RateLimitKeyTest < ActiveSupport::TestCase
     JobResult.delete_all
   end
 
-  test "a key and a group that are both nil fall back to the class's budget" do
-    job_class = rate_limited_job("NilKeyAndGroupJob", group: ->(*) { }, key: ->(*) { })
-    jobs = 2.times.map { job_class.perform_later }
+  test "a key that comes out blank isn't limited, as a blank concurrency key isn't" do
+    [ { group: ->(*) { }, key: ->(*) { } }, { group: nil, key: ->(*) { } } ].each do |options|
+      job_class = rate_limited_job("BlankKeyJob", **options)
+      jobs = 2.times.map { job_class.perform_later }
 
-    assert_equal [ jobs.first.provider_job_id ], claim.map(&:job_id)
-    assert_equal [ job_class.name ], SolidQueue::RateLimitState.pluck(:key)
+      assert_equal provider_ids(jobs), claim.map(&:job_id)
+      assert_empty SolidQueue::RateLimitState.all
+    end
   end
 
   test "a deferral instruments the keys it deferred, once for each class" do
