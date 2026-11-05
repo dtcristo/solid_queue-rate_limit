@@ -197,6 +197,34 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     assert_equal 0, SolidQueue::Semaphore.sole.value
   end
 
+  test "a deferred job that comes back takes a semaphore again" do
+    spend_budget_of("a")
+    returning = SyncAccountJob.perform_later("a")
+    claim(10)
+
+    travel 10.seconds
+    assert_equal 1, SolidQueue::ScheduledExecution.dispatch_next_batch(10)
+    assert_equal [ returning.provider_job_id ], SolidQueue::ReadyExecution.pluck(:job_id)
+    assert_equal 0, SolidQueue::Semaphore.sole.value
+
+    assert_equal [ returning.provider_job_id ], claim(10).map(&:job_id)
+  end
+
+  test "a deferred job that comes back while its semaphore is taken is blocked, and runs once it's free" do
+    spend_budget_of("a")
+    returning = SyncAccountJob.perform_later("a")
+    claim(10)
+    taking = SyncAccountJob.perform_later("b")
+
+    travel 10.seconds
+    SolidQueue::ScheduledExecution.dispatch_next_batch(10)
+    assert_equal [ returning.provider_job_id ], SolidQueue::BlockedExecution.pluck(:job_id)
+
+    assert_equal [ taking.provider_job_id ], claim(10).each(&:perform).map(&:job_id)
+    assert_equal [ returning.provider_job_id ], claim(10).each(&:perform).map(&:job_id)
+    assert_equal %w[ a b a ], JobBuffer.values
+  end
+
   test "discarding a deferred job leaves its semaphore alone, once it's waiting and once it came back blocked" do
     spend_budget_of("a")
     deferred = SyncAccountJob.perform_later("a")
