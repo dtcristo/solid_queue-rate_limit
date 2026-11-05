@@ -96,15 +96,16 @@ module ActiveJob
         rate_limit_per.to_r / rate_limit_to
       end
 
-      def limits_concurrency(**) # :nodoc:
-        ensure_rate_limit_compatible_with_concurrency_controls(concurrency_limited: true)
+      def limits_concurrency(on_conflict: :block, **) # :nodoc:
+        ensure_rate_limit_compatible_with_concurrency_controls(discards_on_conflict: on_conflict == :discard)
         super
       end
 
       private
-        def ensure_rate_limit_compatible_with_concurrency_controls(rate_limited: rate_limited?, concurrency_limited: concurrency_key.present?)
-          if rate_limited && concurrency_limited
-            raise ArgumentError, "`limits_rate` can't be combined with `limits_concurrency` yet. Follow https://github.com/dtcristo/solid_queue-rate_limit/issues/2"
+        # A deferred job that comes back to a taken slot would be discarded, dropping work already accepted
+        def ensure_rate_limit_compatible_with_concurrency_controls(rate_limited: rate_limited?, discards_on_conflict: concurrency_key.present? && concurrency_on_conflict == :discard)
+          if rate_limited && discards_on_conflict
+            raise ArgumentError, "`limits_rate` can't be combined with `limits_concurrency(on_conflict: :discard)`"
           end
         end
     end
