@@ -9,7 +9,7 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   class QuotaJob < ApplicationJob
-    limits_rate to: 90, per: 1.minute, burst: 10, key: :global
+    limits_rate to: 100, per: 1.minute, burst: 10, key: :global
 
     def perform; end
   end
@@ -21,13 +21,13 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
   end
 
   class FullRateJob < ApplicationJob
-    limits_rate to: 5, per: 1.second, burst: 6, key: :global
+    limits_rate to: 10, per: 1.second, burst: 6, key: :global
 
     def perform; end
   end
 
   class FastPollJob < ApplicationJob
-    limits_rate to: 5, per: 1.second, burst: 2, key: :global
+    limits_rate to: 10, per: 1.second, burst: 3, key: :global
 
     def perform; end
   end
@@ -39,50 +39,50 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
   end
 
   class TwoBurstJob < ApplicationJob
-    limits_rate to: 1, per: 1.second, burst: 2, key: :global
+    limits_rate to: 2, per: 1.second, burst: 2, key: :global
 
     def perform; end
   end
 
-  # 100 × (0.1 + 0.1) / 1 = 20, and 11 only covers the dispatcher's poll
+  # A steady 100 a second. 100 × (0.1 + 0.1) / 1 = 20, and 11 only covers the dispatcher's poll
   class HundredBurstTwentyJob < ApplicationJob
-    limits_rate to: 100, per: 1.second, burst: 20, key: :global
+    limits_rate to: 119, per: 1.second, burst: 20, key: :global
 
     def perform; end
   end
 
   class HundredBurstElevenJob < ApplicationJob
-    limits_rate to: 100, per: 1.second, burst: 11, key: :global
+    limits_rate to: 110, per: 1.second, burst: 11, key: :global
 
     def perform; end
   end
 
   class PerShopJob < ApplicationJob
-    limits_rate to: 2, per: 1.second, burst: 3, key: ->(shop) { shop }
+    limits_rate to: 2, per: 1.second, burst: 2, key: ->(shop) { shop }
 
     def perform(shop); end
   end
 
   class StripeCustomerJob < ApplicationJob
-    limits_rate to: 90, per: 1.minute, burst: 10, group: "RecipesStripe", key: :global
+    limits_rate to: 100, per: 1.minute, burst: 10, group: "RecipesStripe", key: :global
 
     def perform(account); end
   end
 
   class StripeRefundJob < ApplicationJob
-    limits_rate to: 90, per: 1.minute, burst: 10, group: "RecipesStripe", key: :global
+    limits_rate to: 100, per: 1.minute, burst: 10, group: "RecipesStripe", key: :global
 
     def perform(charge); end
   end
 
   class ConnectAccountJob < ApplicationJob
-    limits_rate to: 25, per: 1.second, burst: 28, group: "RecipesStripeConnect", key: ->(account) { account }
+    limits_rate to: 20, per: 1.second, burst: 5, group: "RecipesStripeConnect", key: ->(account) { account }
 
     def perform(account); end
   end
 
   class ConnectTransferJob < ApplicationJob
-    limits_rate to: 25, per: 1.second, burst: 28, group: "RecipesStripeConnect", key: ->(account, _amount) { account }
+    limits_rate to: 20, per: 1.second, burst: 5, group: "RecipesStripeConnect", key: ->(account, _amount) { account }
 
     def perform(account, amount); end
   end
@@ -96,7 +96,7 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
 
   class PushInventoryJob < ApplicationJob
     coalesce key: ->(shop, _sku) { shop }, on_conflict: :collect, max_calls: 100
-    limits_rate to: 8, per: 1.minute, burst: 2, key: ->(shop, _sku) { shop }
+    limits_rate to: 10, per: 1.minute, burst: 2, key: ->(shop, _sku) { shop }
 
     def perform_calls(calls)
       JobBuffer.add([ calls.first.arguments.first, calls.map { |call| call.arguments.last } ])
@@ -106,7 +106,7 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
   class SyncShopProductsJob < ApplicationJob
     coalesce key: ->(shop) { shop }
     limits_concurrency key: ->(shop) { shop }
-    limits_rate to: 2, per: 1.second, burst: 3, group: "RecipesShopify", key: :global
+    limits_rate to: 2, per: 1.second, burst: 2, group: "RecipesShopify", key: :global
 
     def perform(shop)
       JobBuffer.add(shop)
@@ -132,13 +132,13 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
     classes.each { |definition| assert Module.new.module_eval(definition) }
   end
 
-  test "a quota per minute never claims more than to + burst in any minute, and keeps up with to" do
+  test "a quota per minute never claims more than to in any minute, and keeps up with to - burst + 1" do
     300.times { QuotaJob.perform_later }
 
     claims = run_dispatcher_and_worker(3.minutes)
 
-    assert_operator most_in_any(60, claims), :<=, 90 + 10
-    assert_operator claims.size, :>=, 10 + 90 * 3 - 2
+    assert_operator most_in_any(60, claims), :<=, 100
+    assert_operator claims.size, :>=, 10 + 91 * 3 - 2
   end
 
   test "spaced jobs are never claimed less than the interval apart" do
@@ -156,19 +156,21 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
     claims = run_dispatcher_and_worker(15.seconds)
 
     assert_equal 60, claims.size
+    assert_operator most_in_any(1, claims), :<=, 10
     assert_operator claims.max, :<=, (60 - 6) / 5.0 + 1.5
   end
 
-  test "a faster dispatcher poll needs a smaller burst to drain a backlog at the full rate" do
+  test "a faster dispatcher poll needs a smaller burst, which leaves more of to for the steady rate" do
     60.times { FastPollJob.perform_later }
 
     claims = run_dispatcher_and_worker(15.seconds, poll: 0.2)
 
     assert_equal 60, claims.size
-    assert_operator claims.max, :<=, (60 - 2) / 5.0 + 1
+    assert_operator most_in_any(1, claims), :<=, 10
+    assert_operator claims.max, :<=, (60 - 3) / 8.0 + 1
   end
 
-  test "with burst: 1 a backlog falls behind the rate, and burst: 2 keeps up" do
+  test "with burst: 1 a backlog falls behind one a second, and to: 2, burst: 2 keeps up with it" do
     30.times { OneBurstJob.perform_later }
     30.times { TwoBurstJob.perform_later }
 
@@ -194,13 +196,13 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
   test "a key gives each account a budget of its own, and each drains at the full rate" do
     ActiveJob.perform_all_later(%w[ a b ].flat_map { |shop| Array.new(20) { PerShopJob.new(shop) } })
 
-    claims = run_dispatcher_and_worker(15.seconds) { |job_ids| first_arguments(job_ids) }
+    claims = run_dispatcher_and_worker(25.seconds) { |job_ids| first_arguments(job_ids) }
 
     %w[ a b ].each do |shop|
       times = claims.filter_map { |time, label| time if label == shop }
       assert_equal 20, times.size
-      assert_operator most_in_any(1, times), :<=, 3 + 2
-      assert_operator times.max, :<=, (20 - 3) / 2.0 + 1.5
+      assert_operator most_in_any(1, times), :<=, 2
+      assert_operator times.max, :<=, (20 - 2) / 1.0 + 1.5
     end
   end
 
@@ -210,21 +212,21 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
     claims = run_dispatcher_and_worker(3.minutes) { |job_ids| SolidQueue::Job.where(id: job_ids).pluck(:class_name) }
     times = claims.map(&:first)
 
-    assert_operator most_in_any(60, times), :<=, 90 + 10
-    assert_operator times.size, :>=, 10 + 90 * 3 - 2
+    assert_operator most_in_any(60, times), :<=, 100
+    assert_operator times.size, :>=, 10 + 91 * 3 - 2
     assert_equal [ StripeCustomerJob.name, StripeRefundJob.name ], claims.map(&:last).uniq.sort
   end
 
   test "classes in a group with a key share each account's budget, and each account drains at the full rate" do
     ActiveJob.perform_all_later(%w[ a b ].flat_map { |account| Array.new(40) { ConnectAccountJob.new(account) } + Array.new(40) { |i| ConnectTransferJob.new(account, i) } })
 
-    claims = run_dispatcher_and_worker(5.seconds, poll: 1) { |job_ids| first_arguments(job_ids) }
+    claims = run_dispatcher_and_worker(8.seconds, poll: 0.2) { |job_ids| first_arguments(job_ids) }
 
     %w[ a b ].each do |account|
       times = claims.filter_map { |time, label| time if label == account }
       assert_equal 80, times.size
-      assert_operator most_in_any(1, times), :<=, 28 + 25
-      assert_operator times.max, :<=, (80 - 28) / 25.0 + 1.5
+      assert_operator most_in_any(1, times), :<=, 20
+      assert_operator times.max, :<=, (80 - 5) / 16.0 + 1
     end
   end
 
@@ -235,8 +237,8 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
     times = claims.map(&:first)
 
     assert_equal 150, claims.size
-    assert_operator most_in_any(60, times), :<=, 100 + 10
-    assert_operator times.max, :<=, (150 - 10) * 0.6 + 1.5
+    assert_operator most_in_any(60, times), :<=, 100
+    assert_operator times.max, :<=, (150 - 10) * 60 / 91.0 + 1.5
     claims.group_by(&:first).each_value { |claimed_together| assert_equal claimed_together.map(&:last).uniq, claimed_together.map(&:last) }
   end
 
@@ -252,7 +254,7 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
       skus = requests.filter_map { |requested, batch| batch if requested == shop }
 
       assert_equal 10, times.size
-      assert_operator most_in_any(60, times), :<=, 2 + 8
+      assert_operator most_in_any(60, times), :<=, 10
       assert skus.all? { |batch| batch.size <= 100 }
       assert_equal (0...1000).to_a, skus.flatten.sort
     end
@@ -264,8 +266,8 @@ class SolidQueue::RateLimitRecipesTest < ActiveSupport::TestCase
     times = run_dispatcher_and_worker(10.seconds)
 
     assert_equal %w[ a b c d e f g h ], JobBuffer.values.sort
-    assert_operator most_in_any(1, times), :<=, 3 + 2
-    assert_operator times.max, :<=, (8 - 3) / 2.0 + 1.5
+    assert_operator most_in_any(1, times), :<=, 2
+    assert_operator times.max, :<=, (8 - 2) / 1.0 + 1.5
     assert_equal 0, SolidQueue::Semaphore.where("value < 1").count
   end
 

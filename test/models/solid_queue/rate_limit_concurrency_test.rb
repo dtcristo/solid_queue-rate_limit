@@ -6,21 +6,21 @@ require "test_helper"
 class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
-  class TenASecondJob < ApplicationJob
-    limits_rate to: 10, per: 1.second, burst: 3, key: :global
+  class TwelveASecondJob < ApplicationJob
+    limits_rate to: 12, per: 1.second, burst: 3, key: :global
 
     def perform; end
   end
 
-  class FiveASecondJob < ApplicationJob
-    limits_rate to: 5, per: 1.second, burst: 2, key: :global
+  class SixASecondJob < ApplicationJob
+    limits_rate to: 6, per: 1.second, burst: 2, key: :global
 
     def perform; end
   end
 
   # Two classes sharing a group, with a budget for each key
   class GroupedJob < ApplicationJob
-    limits_rate to: 5, per: 1.second, burst: 2, group: "Grouped", key: ->(account) { account }
+    limits_rate to: 6, per: 1.second, burst: 2, group: "Grouped", key: ->(account) { account }
 
     def perform(account); end
   end
@@ -35,7 +35,7 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
   # long enough that two runs for one account would overlap.
   class SyncAccountJob < ApplicationJob
     limits_concurrency key: ->(account) { account }
-    limits_rate to: 10, per: 1.second, burst: 3, key: :global
+    limits_rate to: 12, per: 1.second, burst: 3, key: :global
 
     cattr_accessor :runs
 
@@ -165,10 +165,10 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
     # Two limited classes in overlapping batches, and unlimited jobs among them.
     # One limit's state exists already, and the other's is created by the claims.
     def enqueue_jobs
-      SolidQueue::RateLimitState.create!(key: "#{TenASecondJob.name}/global", tat: Time.current)
+      SolidQueue::RateLimitState.create!(key: "#{TwelveASecondJob.name}/global", tat: Time.current)
 
-      ActiveJob.perform_all_later(Array.new(30) { TenASecondJob.new } + Array.new(15) { FiveASecondJob.new } + Array.new(30) { UnlimitedJob.new })
-      ActiveJob.perform_all_later(Array.new(30) { [ TenASecondJob.new, FiveASecondJob.new, UnlimitedJob.new ].sample })
+      ActiveJob.perform_all_later(Array.new(30) { TwelveASecondJob.new } + Array.new(15) { SixASecondJob.new } + Array.new(30) { UnlimitedJob.new })
+      ActiveJob.perform_all_later(Array.new(30) { [ TwelveASecondJob.new, SixASecondJob.new, UnlimitedJob.new ].sample })
       ActiveJob.perform_all_later(Array.new(20) { |i| [ GroupedJob, OtherGroupedJob ][i % 2].new(%w[ a b ][i / 10]) })
 
       SolidQueue::Job.pluck(:id, :class_name).to_h
@@ -177,8 +177,8 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
     # The limits enqueue_jobs sets up, each with the class it's charged with and how many jobs it admits
     def enqueued_limits(job_classes)
       {
-        "#{TenASecondJob.name}/global" => [ TenASecondJob, job_classes.values.count(TenASecondJob.name) ],
-        "#{FiveASecondJob.name}/global" => [ FiveASecondJob, job_classes.values.count(FiveASecondJob.name) ],
+        "#{TwelveASecondJob.name}/global" => [ TwelveASecondJob, job_classes.values.count(TwelveASecondJob.name) ],
+        "#{SixASecondJob.name}/global" => [ SixASecondJob, job_classes.values.count(SixASecondJob.name) ],
         "Grouped/a" => [ GroupedJob, 10 ],
         "Grouped/b" => [ GroupedJob, 10 ]
       }
@@ -243,14 +243,17 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
       Array.new(errors.size) { errors.pop }.map { |error| "#{error.class}: #{error.message}" }
     end
 
-    # GCRA admits at most burst + floor(w / T) in any window of length w. It's
-    # exact, so it's checked in rationals.
+    # GCRA admits at most burst + floor(w / T) from one admission to another w later,
+    # and so at most to in any per. It's exact, so it's checked in rationals.
     def assert_within_rate(job_class, times)
       times.each_with_index do |first, i|
         times.each_with_index.drop(i + 1).each do |last, j|
           allowed = job_class.rate_limit_burst + ((last.to_r - first.to_r) / job_class.rate_limit_interval).floor
           assert_operator j - i + 1, :<=, allowed, "#{job_class.name} admitted #{j - i + 1} jobs in #{(last - first).round(3)}s"
         end
+
+        in_per = times.count { |time| time.to_r >= first.to_r && time.to_r < first.to_r + job_class.rate_limit_per.to_r }
+        assert_operator in_per, :<=, job_class.rate_limit_to, "#{job_class.name} admitted #{in_per} jobs in a #{job_class.rate_limit_per.inspect}"
       end
     end
 end

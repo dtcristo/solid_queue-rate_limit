@@ -20,9 +20,9 @@ module ActiveJob
     end
 
     module ClassMethods
-      # Admits this class's jobs at worker claim no faster than +to+ per +per+,
-      # using GCRA. A job over the limit waits as a scheduled job, without taking
-      # a worker thread or a retry, and is checked again when it's dispatched.
+      # Admits at most +to+ of this class's jobs at worker claim in any +per+, using
+      # GCRA. A job over the limit waits as a scheduled job, without taking a worker
+      # thread or a retry, and is checked again when it's dispatched.
       #
       #   class SyncStripeJob < ApplicationJob
       #     limits_rate to: 100, per: 1.minute, burst: 10, key: :global
@@ -30,13 +30,14 @@ module ActiveJob
       #
       # ==== Options
       #
-      # * +:to+ - Required. A positive integer, how many jobs a +per+ admits.
-      # * +:per+ - Required. A positive duration. Admissions are spaced <tt>per / to</tt>
-      #   apart, which has to be at least 1 ms.
+      # * +:to+ - Required. A positive integer, the most jobs any +per+ admits.
+      # * +:per+ - Required. A positive duration.
       # * +:key+ - Required. A String or Symbol literal, or a Proc that receives the job's
       #   arguments, as in +limits_concurrency+. Each value gets a budget of its own. A
       #   +nil+ or +false+ key turns the limit off, as it turns off +limits_concurrency+.
-      # * +:burst+ - How many jobs a fully recovered budget admits at once. Defaults to 1.
+      # * +:burst+ - How many jobs a fully recovered budget admits at once, up to +to+.
+      #   Defaults to 1. After a burst, admissions are spaced <tt>per / (to - burst + 1)</tt>
+      #   apart, which has to be at least 1 ms.
       # * +:group+ - Shares the budget with every class that names the same group. Takes
       #   the same values as +:key+. Defaults to the class's name.
       #
@@ -67,8 +68,12 @@ module ActiveJob
           raise ArgumentError, "`burst` must be a positive integer"
         end
 
-        if per.to_r / to < MIN_RATE_LIMIT_INTERVAL
-          raise ArgumentError, "`limits_rate to: #{to}, per: #{per.inspect}` would admit jobs less than 1 ms apart, and they have to be at least 1 ms apart"
+        if burst > to
+          raise ArgumentError, "`burst` can't be more than `to`"
+        end
+
+        if rate_limit_interval_for(to, per, burst) < MIN_RATE_LIMIT_INTERVAL
+          raise ArgumentError, "`limits_rate to: #{to}, per: #{per.inspect}, burst: #{burst}` would admit jobs less than 1 ms apart, and they have to be at least 1 ms apart"
         end
 
         if @rate_limit_declared
@@ -89,9 +94,9 @@ module ActiveJob
         rate_limit_key ? true : false
       end
 
-      # The seconds between admissions
+      # The seconds between admissions after a burst, so that any +per+ admits at most +to+
       def rate_limit_interval # :nodoc:
-        rate_limit_per.to_r / rate_limit_to
+        rate_limit_interval_for(rate_limit_to, rate_limit_per, rate_limit_burst)
       end
 
       def limits_concurrency(on_conflict: :block, **) # :nodoc:
@@ -100,6 +105,10 @@ module ActiveJob
       end
 
       private
+        def rate_limit_interval_for(to, per, burst)
+          per.to_r / (to - burst + 1)
+        end
+
         # A deferred job that comes back to a taken slot would be discarded, dropping work already accepted
         def ensure_rate_limit_compatible_with_concurrency_controls(rate_limited: rate_limited?, discards_on_conflict: concurrency_key.present? && concurrency_on_conflict == :discard)
           if rate_limited && discards_on_conflict

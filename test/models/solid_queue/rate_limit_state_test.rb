@@ -2,7 +2,7 @@
 
 require "test_helper"
 
-# GCRA with T = per / to and τ = (burst - 1) × T, as the spec states it
+# GCRA with T = per / (to - burst + 1) and τ = (burst - 1) × T, as the spec states it
 class SolidQueue::RateLimitStateTest < ActiveSupport::TestCase
   setup do
     @now = Time.utc(2026, 1, 1, 12)
