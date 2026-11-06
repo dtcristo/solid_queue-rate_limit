@@ -74,7 +74,7 @@ Each process caches whether the table exists, so restart workers and web process
 
 The gem relies on private Solid Queue methods, so its gemspec allows one minor version of Solid Queue at a time, from 1.7.2.
 
-[CHANGELOG.md](CHANGELOG.md) lists what changed in each version.
+To upgrade from an earlier version, follow [UPGRADING.md](UPGRADING.md). [CHANGELOG.md](CHANGELOG.md) lists what changed in each version.
 
 ## Recipes
 

@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-06
+
+Adds a budget for each key with `key:` and `group:`, `limits_rate` and `limits_concurrency` on one class, a cleanup for idle budgets, and a retry for claims and dispatches that deadlock. Upgrading takes code changes but no migration: every `limits_rate` needs a `key:`, `to:` now includes the burst, and Solid Queue 1.7.2 is required. See [UPGRADING.md](https://github.com/dtcristo/solid_queue-rate_limit/blob/main/UPGRADING.md).
+
 ### Added
 
 - `key:` and `group:` for `limits_rate`, which take what `limits_concurrency` takes. `key:` gives each value a budget of its own, such as one for each account, and `group:` shares a budget between the classes that name it. The key is built like Solid Queue's concurrency key, worked out once when Solid Queue enqueues the job, and kept by its retries. Upgrading needs no migration. ([#19](https://github.com/dtcristo/solid_queue-rate_limit/pull/19), [#24](https://github.com/dtcristo/solid_queue-rate_limit/pull/24))
@@ -17,9 +21,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- `limits_rate`'s `to:` is the most a budget admits in any `per`, burst included, as `to:` is in Rails' `rate_limit` and `limits_concurrency`. It was the steady rate, with the burst on top, so `to: 100, per: 1.minute, burst: 10` could admit 109 in a minute. After a burst, jobs are now spaced `per / (to - burst + 1)` apart, and a backlog drains at `to - burst + 1` per `per`. To keep a limit as 0.1.0 enforced it, add `burst - 1` to `to`. A `burst` above `to` raises `ArgumentError`, and the README's recipes and backlog rule use the new meaning. ([#25](https://github.com/dtcristo/solid_queue-rate_limit/pull/25))
-- `limits_rate` requires `key:`, as `limits_concurrency` and Solid Queue Coalesce's `coalesce` do, and `group:` defaults to Solid Queue's `->(*) { self.class.name }`. Add `key: :global` for one budget per class, stored as `JobClass/global`, or `key: ->(*) {}` to keep the 0.1.0 budget, stored as `JobClass`. A `nil` or `false` key turns the limit off, as it turns off `limits_concurrency`, and a job whose key comes out blank isn't limited, as a job whose concurrency key is blank isn't. With `:global`, jobs enqueued by 0.1.0 drain on the old budget while new ones use the new one, so the limit can admit up to twice its rate until they're gone. Every limited job stores its key, so each claim with limited jobs reads their keys in one more query. ([#24](https://github.com/dtcristo/solid_queue-rate_limit/pull/24))
-- Requires Solid Queue 1.7.2 or newer within 1.7, because giving a deferred job's concurrency slot back relies on 1.7.2 recording which semaphore a job holds. ([#22](https://github.com/dtcristo/solid_queue-rate_limit/pull/22))
+- **Breaking:** `limits_rate`'s `to:` is the most a budget admits in any `per`, burst included, as `to:` is in Rails' `rate_limit` and `limits_concurrency`. It was the steady rate, with the burst on top, so `to: 100, per: 1.minute, burst: 10` could admit 109 in a minute. After a burst, jobs are now spaced `per / (to - burst + 1)` apart, and a backlog drains at `to - burst + 1` per `per`. To keep a limit as 0.1.0 enforced it, add `burst - 1` to `to`. A `burst` above `to` raises `ArgumentError`, and the README's recipes and backlog rule use the new meaning. ([#25](https://github.com/dtcristo/solid_queue-rate_limit/pull/25))
+- **Breaking:** `limits_rate` requires `key:`, as `limits_concurrency` and Solid Queue Coalesce's `coalesce` do, and `group:` defaults to Solid Queue's `->(*) { self.class.name }`. Add `key: :global` for one budget per class, stored as `JobClass/global`, or `key: ->(*) {}` to keep the 0.1.0 budget, stored as `JobClass`. A `nil` or `false` key turns the limit off, as it turns off `limits_concurrency`, and a job whose key comes out blank isn't limited, as a job whose concurrency key is blank isn't. With `:global`, jobs enqueued by 0.1.0 drain on the old budget while new ones use the new one, so the limit can admit up to twice its rate until they're gone. Every limited job stores its key, so each claim with limited jobs reads their keys in one more query. ([#24](https://github.com/dtcristo/solid_queue-rate_limit/pull/24))
+- **Breaking:** Requires Solid Queue 1.7.2 or newer within 1.7, because giving a deferred job's concurrency slot back relies on 1.7.2 recording which semaphore a job holds. ([#22](https://github.com/dtcristo/solid_queue-rate_limit/pull/22))
 - A job that still has a concurrency key after its class dropped `limits_concurrency` is checked against the rate, instead of being admitted without a check. ([#22](https://github.com/dtcristo/solid_queue-rate_limit/pull/22))
 - `defer_rate_limited.solid_queue` includes jobs of classes that also declare `limits_concurrency`. Each blocked job a deferral wakes instruments Solid Queue's `release_blocked.solid_queue`. ([#22](https://github.com/dtcristo/solid_queue-rate_limit/pull/22))
 - `name:` still raises `ArgumentError`, and now links to [#14](https://github.com/dtcristo/solid_queue-rate_limit/issues/14), which tracks multiple limits. ([#19](https://github.com/dtcristo/solid_queue-rate_limit/pull/19))
@@ -38,3 +42,7 @@ The first release adds `limits_rate`, so workers claim a job class's jobs no fas
 - The `defer_rate_limited.solid_queue` event, with `class_name`, `job_ids` and `size`, logged at debug. ([#12](https://github.com/dtcristo/solid_queue-rate_limit/pull/12))
 - Requires Solid Queue 1.7. ([#11](https://github.com/dtcristo/solid_queue-rate_limit/pull/11))
 - A README with recipes, the guarantee and a rule for picking `burst`, and [design notes](https://github.com/dtcristo/solid_queue-rate_limit/blob/main/docs/design.md). ([#13](https://github.com/dtcristo/solid_queue-rate_limit/pull/13))
+
+[Unreleased]: https://github.com/dtcristo/solid_queue-rate_limit/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/dtcristo/solid_queue-rate_limit/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/dtcristo/solid_queue-rate_limit/releases/tag/v0.1.0
