@@ -72,7 +72,7 @@ Until the migration has run, everything else works as before, and enqueuing a jo
 
 Each process caches whether the table exists, so restart workers and web processes after you migrate. A deploy usually does that for you.
 
-The gem relies on private Solid Queue methods, so its gemspec allows one minor version of Solid Queue at a time, from 1.7.2.
+The gem relies on private Solid Queue methods, so its gemspec allows one minor version of Solid Queue at a time.
 
 To upgrade from an earlier version, follow [UPGRADING.md](UPGRADING.md). [CHANGELOG.md](CHANGELOG.md) lists what changed in each version.
 
@@ -369,12 +369,12 @@ It takes `batch_size:`, 500 by default, and `sleep_between_batches:`, like Solid
 | Dependency | Supported |
 | --- | --- |
 | Ruby | 3.2 and newer |
-| Rails | 7.1, 7.2, 8.0 and 8.1. CI also runs Rails main, except on Ruby 3.2 |
-| Solid Queue | 1.7.2 and newer within 1.7 |
+| Rails | 7.1, 7.2, 8.0 and 8.1. CI also runs Rails main |
+| Solid Queue | 1.7. CI runs 1.7.0, 1.7.1, 1.7.2 and main |
 | Database | MySQL, PostgreSQL and SQLite |
 | [Solid Queue Coalesce](https://github.com/dtcristo/solid_queue-coalesce) | Optional. CI tests 0.2 alongside |
 
-CI runs Ruby 3.2, 3.3, 3.4 and 4.0 against all three databases.
+CI runs each Rails and Solid Queue version against all three databases. Ruby 3.2 runs with Rails 7.1, 3.3 with 7.2, 3.4 with 8.0, and 4.0 with the rest.
 
 | Feature | Behaviour |
 | --- | --- |
@@ -430,7 +430,7 @@ Changing a limit and deploying applies to the next claim. A looser limit doesn't
 - A key longer than `solid_queue_rate_limits.key` allows, 255 characters on MySQL, raises `ActiveRecord::ValueTooLong` at enqueue, as an over-long concurrency key does. `perform_later` raises it wrapped in `SolidQueue::Job::EnqueueError`, and `perform_all_later` raises it as it is. PostgreSQL and SQLite have no limit.
 - A retry keeps the key its job was enqueued with. That covers a `retry_on` retry, a failed job you retry, and a retry after the arguments failed to deserialize.
 - A job keeps the key it was enqueued with while it waits, even if its class changes `key:` or `group:`. A job enqueued without a key, before its class declared a limit or by 0.1.0, uses the bare class-wide budget, `JobClass`, and gets the current key if it's retried.
-- `limits_rate` combines with `limits_concurrency`, in either order and through inheritance. A job over the rate gives its concurrency slot back and wakes the next blocked job for its key once the claim commits, and takes one again when the dispatcher brings it back, or is blocked. `limits_concurrency` with `on_conflict: :discard` raises `ArgumentError` with `limits_rate`, because a job that came back to a taken concurrency slot would be discarded. A job that still has a concurrency key after its class dropped `limits_concurrency` is checked like any other.
+- `limits_rate` combines with `limits_concurrency`, in either order and through inheritance. A job over the rate gives its concurrency slot back and wakes the next blocked job for its key once the claim commits, and takes one again when the dispatcher brings it back, or is blocked. `limits_concurrency` with `on_conflict: :discard` raises `ArgumentError` with `limits_rate`, because a job that came back to a taken concurrency slot would be discarded. A job that still has a concurrency key after its class dropped `limits_concurrency` is checked like any other. Before Solid Queue 1.7.2, a slot goes back to whichever semaphore its key has, so a deferred job whose semaphore expired can let one more job than the limit run, as a job that runs past its `duration` can in Solid Queue. 1.7.2 fixes both.
 - Without `group:`, the budget's key starts with the class's name. A job enqueued under an alias, such as a constant kept after a rename, keeps the key it was enqueued with, and shares the class's budget. On MySQL, two classes whose names differ only in case share one budget.
 - A job whose class doesn't load, or whose `class_name` isn't a job class, is claimed without a check and fails as it would without the gem.
 - A class that drops its limit has its waiting jobs claimed when they next check, at most 5 minutes later.

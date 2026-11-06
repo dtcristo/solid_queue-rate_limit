@@ -310,6 +310,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
   end
 
   test "a deferred job that recorded no semaphore gives none back" do
+    skip "Needs Solid Queue 1.7.2" if Gem::Version.new(SolidQueue::VERSION) < Gem::Version.new("1.7.2")
     spend_budget_of("a")
     deferred = SyncAccountJob.perform_later("a")
     update_concurrency_lock(deferred) { |arguments| arguments.merge(SolidQueue::Job::CONCURRENCY_LOCK_KEY => { "semaphore_id" => nil, "limit" => nil }) }
@@ -319,6 +320,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
   end
 
   test "a deferred job dispatched before Solid Queue recorded its semaphore gives back its key's" do
+    skip "Needs Solid Queue 1.7.2" if Gem::Version.new(SolidQueue::VERSION) < Gem::Version.new("1.7.2")
     spend_budget_of("a")
     deferred = SyncAccountJob.perform_later("a")
     update_concurrency_lock(deferred) { |arguments| arguments.except(SolidQueue::Job::CONCURRENCY_LOCK_KEY) }
@@ -328,6 +330,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
   end
 
   test "a deferred job whose semaphore expired and was replaced leaves the new one alone" do
+    skip "Needs Solid Queue 1.7.2" if Gem::Version.new(SolidQueue::VERSION) < Gem::Version.new("1.7.2")
     spend_budget_of("a")
     deferred = SyncAccountJob.perform_later("a")
     blocked = SyncAccountJob.perform_later("b")
@@ -341,6 +344,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
   end
 
   test "a deferred job wakes a blocked job whose class is missing, which fails as in Solid Queue" do
+    skip "Needs Solid Queue 1.7.2" if Gem::Version.new(SolidQueue::VERSION) < Gem::Version.new("1.7.2")
     spend_budget_of("a")
     SyncAccountJob.perform_later("a")
     missing = SyncAccountJob.perform_later("b")
@@ -353,6 +357,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
   end
 
   test "a blocked job whose class raises when it loads stays blocked, and the claim gives the semaphore back and goes on" do
+    skip "Needs Solid Queue 1.7.2" if Gem::Version.new(SolidQueue::VERSION) < Gem::Version.new("1.7.2")
     spend_budget_of("a")
     SyncAccountJob.perform_later("a")
     broken = SyncAccountJob.perform_later("b")
@@ -369,6 +374,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
   end
 
   test "a blocked job whose class raises when it loads doesn't stop a later look" do
+    skip "Needs Solid Queue 1.7.2" if Gem::Version.new(SolidQueue::VERSION) < Gem::Version.new("1.7.2")
     2.times { |i| LimitedJob.perform_later(i) }
     claim(10)
     spend_budget_of("a")

@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Allows Solid Queue 1.7.0 and 1.7.1 again, as 0.1.0 did. Combining `limits_rate` with `limits_concurrency` works on them as Solid Queue does: a deferred job whose semaphore expired can let one more job than the limit run, which Solid Queue 1.7.2 fixes. CI tests each 1.7 release and Solid Queue main, and runs each Ruby with one Rails instead of with every Rails. ([#28](https://github.com/dtcristo/solid_queue-rate_limit/pull/28))
+
 ## [0.2.0] - 2026-11-06
 
 Adds a budget for each key with `key:` and `group:`, `limits_rate` and `limits_concurrency` on one class, a cleanup for idle budgets, and a retry for claims and dispatches that deadlock. Upgrading takes code changes but no migration: every `limits_rate` needs a `key:`, `to:` now includes the burst, and Solid Queue 1.7.2 is required. See [UPGRADING.md](https://github.com/dtcristo/solid_queue-rate_limit/blob/main/UPGRADING.md).

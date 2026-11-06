@@ -22,8 +22,7 @@ Gem::Specification.new do |spec|
   spec.required_ruby_version = ">= 3.2"
 
   # Patches private Solid Queue methods, so each new minor has to be tested first.
-  # 1.7.2 records which semaphore a job holds, so a deferred job gives it back exactly once.
-  spec.add_dependency "solid_queue", ">= 1.7.2", "< 1.8"
+  spec.add_dependency "solid_queue", "~> 1.7.0"
 
   spec.add_development_dependency "appraisal"
   spec.add_development_dependency "debug", "~> 1.9"
