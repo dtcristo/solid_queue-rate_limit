@@ -5,7 +5,7 @@
   </p>
 </div>
 
-Solid Queue Rate Limit adds `limits_rate` to Active Job classes. Workers claim a class's jobs no faster than the rate you declare, and a job over the limit waits as a scheduled job instead of holding a worker thread, sleeping in `perform` or retrying after a 429.
+Solid Queue Rate Limit adds `limits_rate` to Active Job classes. Workers claim no more of a class's jobs in any period than you declare, and a job over the limit waits as a scheduled job instead of holding a worker thread, sleeping in `perform` or retrying after a 429.
 
 ```ruby
 class SyncStripeJob < ApplicationJob
@@ -98,8 +98,8 @@ Use this when an API allows a number of calls in any minute and you want to stay
 
 ```ruby
 class SyncStripeCustomerJob < ApplicationJob
-  # At most 10 + 90 = 100 claims in any minute
-  limits_rate to: 90, per: 1.minute, burst: 10, key: :global
+  # At most 100 claims in any minute, 10 of them at once
+  limits_rate to: 100, per: 1.minute, burst: 10, key: :global
 
   def perform(account_id)
     Account.find(account_id).sync_to_stripe!
@@ -107,7 +107,7 @@ class SyncStripeCustomerJob < ApplicationJob
 end
 ```
 
-A quiet budget lets 10 jobs through at once, then one every 0.67 seconds. The limit isn't a rolling-window counter, so `to:` alone isn't the most a minute can hold. In any window of `w` seconds, workers claim at most `burst + floor(w / (per / to))` jobs. For a quota of `N` per `per`, keep `to + burst` at or below `N`. See [What the limit guarantees](#what-the-limit-guarantees).
+A quiet budget lets 10 jobs through at once, then one every 60 / 91 seconds, about 0.66. That spacing leaves room for the burst, so no minute holds more than 100, and a backlog drains at 91 a minute. See [What the limit guarantees](#what-the-limit-guarantees).
 
 ### Space jobs out evenly
 
@@ -132,8 +132,9 @@ Use this when a backlog builds up and has to drain at the declared rate.
 
 ```ruby
 class SendWebhookJob < ApplicationJob
+  # At most 10 in any second, draining a backlog at 10 - 6 + 1 = 5 a second.
   # 5 × (1 + 0.1) / 1 = 5.5, rounded up, for the default 1-second dispatcher poll and 0.1-second worker poll
-  limits_rate to: 5, per: 1.second, burst: 6, key: :global
+  limits_rate to: 10, per: 1.second, burst: 6, key: :global
 
   def perform(webhook_id)
     Webhook.find(webhook_id).deliver!
@@ -141,7 +142,7 @@ class SendWebhookJob < ApplicationJob
 end
 ```
 
-If 6 jobs at once is too many for the API, make the dispatcher poll more often instead. With a 0.2-second poll, `5 × (0.2 + 0.1) / 1 = 1.5`, which rounds up to 2, so `limits_rate to: 5, per: 1.second, burst: 2, key: :global` is enough:
+If 6 jobs at once is too many for the API, make the dispatcher poll more often instead. With a 0.2-second poll, `limits_rate to: 10, per: 1.second, burst: 3, key: :global` is enough, and leaves more of the 10 for the backlog, which drains at `10 - 3 + 1 = 8` a second. `8 × (0.2 + 0.1) / 1 = 2.4`, which rounds up to 3:
 
 ```yaml
 # config/queue.yml
@@ -159,8 +160,8 @@ Use this when an API's quota is per account, per API key or per tenant, and one 
 
 ```ruby
 class SyncShopOrdersJob < ApplicationJob
-  # 2 calls a second for each shop
-  limits_rate to: 2, per: 1.second, burst: 3, key: ->(shop) { shop }
+  # At most 2 calls in any second for each shop
+  limits_rate to: 2, per: 1.second, burst: 2, key: ->(shop) { shop }
 
   def perform(shop)
     shop.sync_orders!
@@ -168,7 +169,7 @@ class SyncShopOrdersJob < ApplicationJob
 end
 ```
 
-`key:` gets the job's arguments, as in `limits_concurrency`. A record becomes its class name and id, so the shop with id 42 gets a budget of its own, stored under `SyncShopOrdersJob/Shop/42`. A Proc that returns `nil` sends the job to the class's bare budget, `SyncShopOrdersJob`. `burst: 3` follows the [backlog rule](#picking-a-burst-for-a-backlog), and applies to each shop.
+`key:` gets the job's arguments, as in `limits_concurrency`. A record becomes its class name and id, so the shop with id 42 gets a budget of its own, stored under `SyncShopOrdersJob/Shop/42`. A Proc that returns `nil` sends the job to the class's bare budget, `SyncShopOrdersJob`. `burst: 2` follows the [backlog rule](#picking-a-burst-for-a-backlog), and applies to each shop, whose backlog drains at 1 a second.
 
 ### Share a budget between classes
 
@@ -176,7 +177,7 @@ Use this when several job classes call one API, and together they have to stay u
 
 ```ruby
 class SyncStripeCustomerJob < ApplicationJob
-  limits_rate to: 90, per: 1.minute, burst: 10, group: "Stripe", key: :global
+  limits_rate to: 100, per: 1.minute, burst: 10, group: "Stripe", key: :global
 
   def perform(account_id)
     Account.find(account_id).sync_to_stripe!
@@ -184,7 +185,7 @@ class SyncStripeCustomerJob < ApplicationJob
 end
 
 class RefundStripeChargeJob < ApplicationJob
-  limits_rate to: 90, per: 1.minute, burst: 10, group: "Stripe", key: :global
+  limits_rate to: 100, per: 1.minute, burst: 10, group: "Stripe", key: :global
 
   def perform(charge_id)
     Charge.find(charge_id).refund!
@@ -200,7 +201,8 @@ Use this when several job classes call an API whose quota is per account.
 
 ```ruby
 class SyncStripeConnectAccountJob < ApplicationJob
-  limits_rate to: 25, per: 1.second, burst: 28, group: "StripeConnect", key: ->(account) { account }
+  # At most 20 calls in any second for each account, with a 0.2-second dispatcher poll
+  limits_rate to: 20, per: 1.second, burst: 5, group: "StripeConnect", key: ->(account) { account }
 
   def perform(account)
     account.sync_to_stripe!
@@ -208,7 +210,7 @@ class SyncStripeConnectAccountJob < ApplicationJob
 end
 
 class CreateStripeTransferJob < ApplicationJob
-  limits_rate to: 25, per: 1.second, burst: 28, group: "StripeConnect", key: ->(account, _amount) { account }
+  limits_rate to: 20, per: 1.second, burst: 5, group: "StripeConnect", key: ->(account, _amount) { account }
 
   def perform(account, amount)
     account.transfer!(amount)
@@ -216,7 +218,7 @@ class CreateStripeTransferJob < ApplicationJob
 end
 ```
 
-The account with id 7 gets one budget for both classes, stored under `StripeConnect/Account/7`. Each class's Proc gets its own job's arguments, so they can take different ones, as long as they return the same key for the same account.
+The account with id 7 gets one budget for both classes, stored under `StripeConnect/Account/7`. Each class's Proc gets its own job's arguments, so they can take different ones, as long as they return the same key for the same account. With the [0.2-second dispatcher poll](#drain-a-backlog-at-the-full-rate), `burst: 5` follows the [backlog rule](#picking-a-burst-for-a-backlog), and each account's backlog drains at 16 a second.
 
 ### Run one job at a time for each account, under a global rate
 
@@ -224,7 +226,7 @@ Use this when two syncs for one account mustn't run at once, and all accounts to
 
 ```ruby
 class SyncStripeAccountJob < ApplicationJob
-  # One sync at a time for each account, and at most 10 + 100 claims in any minute across all of them
+  # One sync at a time for each account, and at most 100 claims in any minute across all of them
   limits_concurrency key: ->(account) { account }
   limits_rate to: 100, per: 1.minute, burst: 10, group: "Stripe", key: :global
 
@@ -242,10 +244,10 @@ Use this when an account's sync can be asked for many times, only the latest nee
 
 ```ruby
 class SyncShopProductsJob < ApplicationJob
-  # One pending and one running sync for each shop, and at most 3 + 2 claims in any second across them
+  # One pending and one running sync for each shop, and at most 2 claims in any second across them
   coalesce key: ->(shop) { shop }
   limits_concurrency key: ->(shop) { shop }
-  limits_rate to: 2, per: 1.second, burst: 3, group: "Shopify", key: :global
+  limits_rate to: 2, per: 1.second, burst: 2, group: "Shopify", key: :global
 
   def perform(shop)
     shop.sync_products!
@@ -271,9 +273,9 @@ Use this when an API has a bulk endpoint with a quota on requests, and calls arr
 
 ```ruby
 class PushInventoryJob < ApplicationJob
-  # Up to 100 SKUs in each request, and at most 2 + 8 requests in any minute for each shop
+  # Up to 100 SKUs in each request, and at most 10 requests in any minute for each shop
   coalesce key: ->(shop, _sku) { shop }, on_conflict: :collect, max_calls: 100
-  limits_rate to: 8, per: 1.minute, burst: 2, key: ->(shop, _sku) { shop }
+  limits_rate to: 10, per: 1.minute, burst: 2, key: ->(shop, _sku) { shop }
 
   def perform_calls(calls)
     shop = calls.first.arguments.first
@@ -288,7 +290,7 @@ Each call joins the shop's pending job until it holds 100, and the limit is chec
 
 When a worker claims jobs, the gem checks each limited job against its budget, in queue order, inside Solid Queue's claim transaction. A job the budget admits is claimed and runs like any other. A job over the limit moves from `solid_queue_ready_executions` to `solid_queue_scheduled_executions`, with a time to check again. It doesn't take a worker thread, and Active Job doesn't see a retry. When that time comes, the dispatcher makes it ready as usual, and the next claim checks it again.
 
-The checks are staggered. Each waiting job gets the next free slot, one interval `per / to` after the last slot handed out, so 100 waiting jobs come back at 100 different times instead of all on the next poll. Each budget hands out its own slots, so a backlog on one account's key doesn't push back another account's jobs. Slots stop 5 minutes ahead. A job past that checks again in 5 minutes without taking a slot. If waiting jobs get discarded, or you loosen the limit, the slots they held come free within 5 minutes.
+The checks are staggered. Each waiting job gets the next free slot, one interval `per / (to - burst + 1)` after the last slot handed out, so 100 waiting jobs come back at 100 different times instead of all on the next poll. Each budget hands out its own slots, so a backlog on one account's key doesn't push back another account's jobs. Slots stop 5 minutes ahead. A job past that checks again in 5 minutes without taking a slot. If waiting jobs get discarded, or you loosen the limit, the slots they held come free within 5 minutes.
 
 A slot is a hint, and never charges the budget. A job that comes back and finds the budget spent waits again, with the next free slot.
 
@@ -300,13 +302,16 @@ Unlimited jobs keep running. Only limited jobs move to scheduled executions, and
 
 The limit counts claims at the worker gate, the moment a worker takes a job from `solid_queue_ready_executions`. It doesn't count job starts, finishes or the API calls a job makes.
 
-With `T = per / to`, in any window of `w` seconds, workers claim at most `burst + floor(w / T)` of the jobs that share a budget. With `burst: 1` that's even spacing, at least `T` apart. With a larger burst it isn't an exact rolling-window quota. `limits_rate to: 100, per: 1.minute, burst: 10, key: :global` allows 110 claims in a minute that follows a quiet spell.
+Workers claim at most `to` of the jobs that share a budget in any window of `per`, starting at any moment. A quiet budget admits up to `burst` of them at once, and then one every `T = per / (to - burst + 1)`, which is how fast a backlog drains. With `burst: 1` that's even spacing, at least `per / to` apart. `limits_rate to: 100, per: 1.minute, burst: 10, key: :global` allows 10 claims at once, and 100 in any minute.
+
+The limit isn't a rolling-window counter. It spaces claims so that a burst at the start of a window and the claims after it add up to `to`. So a larger burst leaves less of `to` for the rest of the window: `to: 100, burst: 100` admits 100 at once, then one a minute.
 
 Some things fall outside it:
 
 - A claim is charged when it happens, whatever happens next. A worker that crashes after claiming a job has used that budget.
 - A job that comes back to ready is charged again. That covers a `retry_on` retry, a failed job you retry, and a claim released when a worker shuts down.
 - A job can start a moment after its claim, make several API calls, or make one late in a long `perform`. Leave headroom if the API counts something else.
+- A window that spans a change to the limit can hold more than either limit allows. See [`limits_rate` options](#limits_rate-options). So can a group whose classes declare different limits. See [Rules and limitations](#rules-and-limitations).
 - Each worker reads the time from its own clock. Skew between hosts can let claims through closer together than `T`, so keep their clocks in sync, as Solid Queue's scheduled jobs already need.
 - It's not FIFO. Jobs are checked in queue order within a claim, but a waiting job can be overtaken by one that arrives after the budget recovers, or one whose slot comes sooner.
 
@@ -314,33 +319,35 @@ Some things fall outside it:
 
 A job that reaches a worker while the budget has room runs straight away, whatever the burst. A backlog is different. Its jobs come back from waiting through the dispatcher, which promotes due jobs once per `polling_interval` (1 second by default), and a worker claims them shortly after.
 
-`burst` also sets how early a job can reach the gate and still get in. Each burst above 1 allows one more interval `per / to`. With `burst: 1` there's no slack. A waiting job that arrives even a millisecond before the interval since the last claim has passed waits again, behind the rest of the backlog. Dispatch and claim delays vary by tens of milliseconds, so this happens to a good share of waiting jobs. Polling more often doesn't help, because the delays still vary.
+`burst` also sets how early a job can reach the gate and still get in. Each burst above 1 allows one more interval `T`. With `burst: 1` there's no slack. A waiting job that arrives even a millisecond before the interval since the last claim has passed waits again, behind the rest of the backlog. Dispatch and claim delays vary by tens of milliseconds, so this happens to a good share of waiting jobs. Polling more often doesn't help, because the delays still vary.
 
-For a backlog to drain at the full rate, `burst` has to cover two things. A dispatcher poll makes about `to × polling_interval / per` jobs due at once, and one claim takes them together. On top of that, the slack has to cover how much a worker's claim delay varies, which is up to the worker's own `polling_interval`. So set `burst` to at least `to × (dispatcher polling_interval + worker polling_interval) / per`, rounded up, and to at least 2. With Solid Queue's defaults of 1 and 0.1 seconds, that's `burst: 2` for 1 job a second, and `burst: 6` for 5. The cost is that a quiet budget lets that many jobs through at once.
+A backlog drains at one job every `T`, that is `to - burst + 1` per `per`. To drain at that rate, `burst` has to cover two things. A dispatcher poll makes about `polling_interval / T` jobs due at once, and one claim takes them together. On top of that, the slack has to cover how much a worker's claim delay varies, which is up to the worker's own `polling_interval`. So set `burst` to at least `(dispatcher polling_interval + worker polling_interval) / T`, rounded up, and to at least 2.
 
-This is a rule of thumb that fits the measurements below and the recipe test's simulation, not a bound. Slow claims or busy workers can need more. In the simulation, 100 jobs a second with a 0.1-second dispatcher poll fell behind with `burst: 11` and kept up with `burst: 20`.
+For a limit of `to` per `per`, with `p` for the two polling intervals added up, that's `burst` of at least `(to + 1) × p / (per + p)`, rounded up, and at least 2. With Solid Queue's defaults of 1 and 0.1 seconds, that's `burst: 2` for `to: 2, per: 1.second`, which drains at 1 a second, and `burst: 6` for `to: 10`, which drains at 5. If the result is more than `to`, `per` is too short for the polls. Make the dispatcher poll more often, or accept a backlog that drains more slowly. The cost of a larger burst is that a quiet budget lets that many jobs through at once, and the backlog drains more slowly.
+
+This is a rule of thumb that fits the measurements below and the recipe test's simulation, not a bound. Slow claims or busy workers can need more. In the simulation, a backlog draining at 100 jobs a second with a 0.1-second dispatcher poll fell behind with `to: 110, burst: 11` and kept up with `to: 119, burst: 20`.
 
 These numbers come from 30 to 60 waiting jobs, with one worker polling every 0.1 seconds, on SQLite:
 
-| Limit | Dispatcher poll | `burst` | Backlog drained at |
-| --- | --- | --- | --- |
-| 1 per second | 1 s | 1 | 0.55 per second |
-| 1 per second | 1 s | 2 | 0.95 per second |
-| 1 per second | 0.1 s | 1 | 0.53 per second |
-| 1 per second | 0.1 s | 2 | 1.0 per second |
-| 2 per second | 1 s | 2 | 1.53 per second |
-| 2 per second | 1 s | 3 | 1.9 per second |
-| 5 per second | 1 s | 5 | 4.61 per second |
-| 5 per second | 1 s | 6 | 4.91 per second |
-| 1 per 3 seconds | 1 s | 1 | 0.30 per second |
-| 1 per 3 seconds | 1 s | 2 | 0.33 per second |
+| Limit | `burst` | Dispatcher poll | Drains at, at most | Backlog drained at |
+| --- | --- | --- | --- | --- |
+| 1 per second | 1 | 1 s | 1 per second | 0.55 per second |
+| 2 per second | 2 | 1 s | 1 per second | 0.95 per second |
+| 1 per second | 1 | 0.1 s | 1 per second | 0.53 per second |
+| 2 per second | 2 | 0.1 s | 1 per second | 1.0 per second |
+| 3 per second | 2 | 1 s | 2 per second | 1.53 per second |
+| 4 per second | 3 | 1 s | 2 per second | 1.9 per second |
+| 9 per second | 5 | 1 s | 5 per second | 4.61 per second |
+| 10 per second | 6 | 1 s | 5 per second | 4.91 per second |
+| 1 per 3 seconds | 1 | 1 s | 1 per 3 seconds | 0.30 per second |
+| 2 per 3 seconds | 2 | 1 s | 1 per 3 seconds | 0.33 per second |
 
 ## Things to know
 
 - It's a separate gem that adds to Solid Queue from the outside, with its own table. It only works with the Solid Queue adapter, because it checks the limit inside Solid Queue's claim.
 - It works with [Solid Queue Coalesce](https://github.com/dtcristo/solid_queue-coalesce), which coalesces calls when they're enqueued, before the limit checks the job at claim. See [Collapse calls for each account and run them one at a time, under a global rate](#collapse-calls-for-each-account-and-run-them-one-at-a-time-under-a-global-rate).
-- The limit counts claims, not API calls, and isn't an exact rolling-window quota once `burst` is above 1. See [What the limit guarantees](#what-the-limit-guarantees).
-- With `burst: 1`, a backlog drains slower than the rate. See [Picking a burst for a backlog](#picking-a-burst-for-a-backlog).
+- The limit counts claims, not API calls. A larger `burst` leaves less of `to` for a backlog, which drains at `to - burst + 1` per `per`. See [What the limit guarantees](#what-the-limit-guarantees).
+- With `burst: 1`, a backlog drains slower than `to` per `per`. See [Picking a burst for a backlog](#picking-a-burst-for-a-backlog).
 - A waiting job is a scheduled job with its own `scheduled_at` kept, and checks again at most 5 minutes later. See [How waiting works](#how-waiting-works).
 - Each job class has its own budgets, and so does each subclass, unless it declares `group:`. See [Rules and limitations](#rules-and-limitations).
 - When the app is eager-loaded and no class declares `limits_rate`, claims run exactly Solid Queue's queries. Otherwise each claim reads the class names of the jobs it locked, reads the limited jobs' keys in one more query, and locks one row per budget. When it defers jobs that hold a concurrency slot, it loads them, gives their concurrency slots back and wakes the next blocked job for each.
@@ -384,10 +391,10 @@ CI runs Ruby 3.2, 3.3, 3.4 and 4.0 against all three databases.
 limits_rate to:, per:, key:, burst: 1, group: ->(*) { self.class.name }
 ```
 
-- `to` is required, and is a positive integer: how many jobs a `per` admits.
-- `per` is required, and is a positive duration. Workers admit jobs `per / to` apart, which has to be at least 1 millisecond.
+- `to` is required, and is a positive integer: the most jobs any `per` admits.
+- `per` is required, and is a positive duration.
 - `key` is required, and identifies the jobs that share a budget, as in `limits_concurrency`.
-- `burst` is a positive integer, 1 by default: how many jobs a quiet budget admits at once.
+- `burst` is a positive integer, 1 by default, and at most `to`: how many jobs a quiet budget admits at once. After a burst, workers admit jobs `per / (to - burst + 1)` apart, which has to be at least 1 millisecond.
 - `group` shares the budget with every class that names the same group. It takes the same values as `key`. Without it, the budget belongs to the class.
 
 `key` and `group` work like the ones `limits_concurrency` takes, and the gem builds a budget's key the way Solid Queue builds a concurrency key: the group, or the class's name, then the key's value, joined with `/`.
@@ -412,7 +419,7 @@ Except for `key:`, an invalid option raises `ArgumentError` when the class loads
 
 The key is computed once, when Solid Queue enqueues the job, and stored with it, so a claim never deserializes arguments or loads records. A key Proc that raises fails the enqueue. `perform_now` and other adapters never run it.
 
-Changing a limit and deploying applies to the next claim. A looser limit doesn't pay off all the debt the old one built up. The claim caps it at `burst` intervals of the new limit, rounded up to the microsecond, so new admissions start within one new interval and a microsecond. Jobs already waiting keep the next checks the old limit gave them, and new waiting jobs get slots after those, so a backlog can take up to 5 minutes to speed up. A tighter limit starts from the budget as the old one left it.
+Changing a limit and deploying applies to the next claim. A looser limit doesn't pay off all the debt the old one built up. The claim caps it at `burst` intervals of the new limit, rounded up to the microsecond, so new admissions start within one new interval and a microsecond. Jobs already waiting keep the next checks the old limit gave them, and new waiting jobs get slots after those, so a backlog can take up to 5 minutes to speed up. A tighter limit starts from the budget as the old one left it, so a window that spans the deploy can hold more than the new limit allows, until one new `per` has passed.
 
 ## Rules and limitations
 

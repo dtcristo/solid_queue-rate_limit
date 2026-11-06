@@ -15,7 +15,7 @@ class SolidQueue::RateLimitStaggerTest < ActiveSupport::TestCase
 
   # Enough burst for a dispatcher that polls every second: to × polling_interval / per = 2
   class TwiceASecondJob < ApplicationJob
-    limits_rate to: 2, per: 1.second, burst: 4, key: :global
+    limits_rate to: 5, per: 1.second, burst: 4, key: :global
 
     def perform; end
   end

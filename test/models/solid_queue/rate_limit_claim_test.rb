@@ -6,11 +6,18 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   class LimitedJob < ApplicationJob
-    limits_rate to: 1, per: 10.seconds, burst: 2, key: :global
+    limits_rate to: 2, per: 10.seconds, burst: 2, key: :global
 
     def perform(value)
       JobBuffer.add(value)
     end
+  end
+
+  # 2 at once, then one every 5 seconds, so at most 3 in any 10 seconds
+  class CappedJob < ApplicationJob
+    limits_rate to: 3, per: 10.seconds, burst: 2, key: :global
+
+    def perform(value); end
   end
 
   class CasedJob < ApplicationJob
@@ -72,6 +79,24 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     assert_equal provider_ids(jobs.first(2)), claimed.map(&:job_id)
     assert_equal provider_ids(jobs.last(2)), SolidQueue::ScheduledExecution.order(:job_id).pluck(:job_id)
     assert_equal 0, SolidQueue::ReadyExecution.count
+  end
+
+  test "admits at most to in any per, with the burst at the start of it" do
+    start = Time.current
+    2.times { |i| CappedJob.perform_later(i) }
+    assert_equal 2, claim(10).size
+
+    travel_to start + 5.seconds
+    CappedJob.perform_later(2)
+    assert_equal 1, claim(10).size
+
+    travel_to start + Rational(9_999_999, 1_000_000), with_usec: true
+    CappedJob.perform_later(3)
+    assert_equal 0, claim(10).size
+
+    travel_to start + 10.seconds
+    CappedJob.perform_later(4)
+    assert_equal 1, claim(10).size
   end
 
   test "a deferral instruments defer_rate_limited for each class" do
@@ -416,7 +441,7 @@ class SolidQueue::RateLimitClaimTest < ActiveSupport::TestCase
     assert_equal 2, claim(10).size
 
     # A deploy that loosens the limit: the old debt is clamped to the new burst
-    LimitedJob.with(rate_limit_to: 10, rate_limit_burst: 10) do
+    LimitedJob.with(rate_limit_to: 19, rate_limit_burst: 10) do
       LimitedJob.perform_later(2)
       assert_equal 0, claim(10).size
       assert_equal Time.current + 1.second, SolidQueue::ScheduledExecution.sole.scheduled_at

@@ -43,11 +43,25 @@ class SolidQueue::RateLimitDeclarationTest < ActiveSupport::TestCase
     end
   end
 
+  test "burst can't be more than to" do
+    error = assert_raises(ArgumentError) { job { limits_rate to: 2, per: 1.minute, burst: 3, key: :global } }
+    assert_equal "`burst` can't be more than `to`", error.message
+
+    assert_equal 2, job { limits_rate to: 2, per: 1.minute, burst: 2, key: :global }.rate_limit_burst
+  end
+
   test "spacing below 1 ms raises" do
     error = assert_raises(ArgumentError) { job { limits_rate to: 1_001, per: 1.second, key: :global } }
     assert_match(/at least 1 ms apart/, error.message)
 
     assert_equal 1_000, job { limits_rate to: 1_000, per: 1.second, key: :global }.rate_limit_to
+  end
+
+  test "spacing below 1 ms raises, counting the burst" do
+    error = assert_raises(ArgumentError) { job { limits_rate to: 1_002, per: 1.second, burst: 2, key: :global } }
+    assert_match(/at least 1 ms apart/, error.message)
+
+    assert_equal 1_001, job { limits_rate to: 1_001, per: 1.second, burst: 2, key: :global }.rate_limit_to
   end
 
   test "declares a key and a group, as limits_concurrency takes them" do

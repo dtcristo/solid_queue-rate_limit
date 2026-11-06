@@ -28,7 +28,7 @@ At enqueue the gem only checks that the table exists, and works out the job's ke
 | Budget | One GCRA state, shared by every job with the same key |
 | Key | The name of a budget's state row, built from the class's `group:` and `key:` |
 | Group | What `group:` names, so several classes share their budgets. Defaults to the class's name |
-| `T` | The interval between admissions, `per / to` |
+| `T` | The interval between admissions after a burst, `per / (to - burst + 1)` |
 | `τ` | The slack a burst gives, `(burst - 1) × T` |
 | TAT | GCRA's theoretical arrival time, stored per limit. The budget is full when it's in the past |
 | Slot | A next-check time handed to a waiting job. A hint, never a charge |
@@ -153,17 +153,19 @@ On SQLite there are no row locks. A claim is a write transaction, and claims tak
 
 ## GCRA
 
-With `T = per / to` and `τ = (burst - 1) × T`:
+With `T = per / (to - burst + 1)` and `τ = (burst - 1) × T`:
 
 1. Clamp: `tat = min(tat, now + burst × T)`.
 2. Admit when `tat <= now + τ`, and then set `tat = max(tat, now) + T`.
 3. Round `tat` up to the microsecond.
 
-From a full budget that admits `burst` jobs at once, then one every `T`. In any window of length `w`, it admits at most `burst + floor(w / T)`.
+From a full budget that admits `burst` jobs at once, then one every `T`. From one admission to another `w` later, it admits at most `burst + floor(w / T)`, and in any window `[t, t + per)`, at most `to`.
 
-Here's why. Say the first admission in the window is at `t1`. After `i` admissions, `tat` is at least `t1 + i × T`. The next admission at time `t` needs `tat <= t + τ`. So it can't come before `t1 + (i - burst + 1) × T`.
+Here's why. Say the first admission in the window is at `t1`. After `i` admissions, `tat` is at least `t1 + i × T`. The next admission at time `t` needs `tat <= t + τ`. So it can't come before `t1 + (i - burst + 1) × T`. Admission number `to + 1` has `i = to`, so it can't come before `t1 + (to - burst + 1) × T`, which is `t1 + per`.
 
-The clamp never changes anything under a constant limit, because an admission leaves `tat` at most `now + burst × T`. It only matters after a deploy loosens the limit. Without it, debt built up under the old limit would hold the new one back, and with a much smaller `T` that could last minutes. With it, the debt left is at most `burst` new intervals, rounded up to the microsecond, so the next admission is at most one new interval and a microsecond away. Slots handed out under the old limit stay, and new slots go after them, so waiting jobs can take up to 5 minutes to catch up.
+`T` is chosen so that `to` is a cap, as `to:` is in Rails' `rate_limit` and in `limits_concurrency`, and the burst comes out of it. The steady rate is `to - burst + 1` per `per`. With `T = per / to`, a burst would come on top of `to`, and `to: 100, per: 1.minute, burst: 10` would admit 109 in a minute.
+
+The bound holds under a constant limit. A window that spans a change, looser or tighter, can hold more than either limit allows, because the budget keeps the old limit's state and each claim applies its own class's settings. The clamp never changes anything under a constant limit, because an admission leaves `tat` at most `now + burst × T`. It only matters after a deploy loosens the limit. Without it, debt built up under the old limit would hold the new one back, and with a much smaller `T` that could last minutes. With it, the debt left is at most `burst` new intervals, rounded up to the microsecond, so the next admission is at most one new interval and a microsecond away. Slots handed out under the old limit stay, and new slots go after them, so waiting jobs can take up to 5 minutes to catch up.
 
 Rounding down would drop a little debt on every admission, and datetime columns store microseconds. So `tat` rounds up, and a limit can only err on the slow side. `T` has to be at least 1 ms, so rounding never takes a large share of it.
 
@@ -276,9 +278,9 @@ A job that comes back to ready is charged again, against the key it was enqueued
 
 Waiting jobs come back through the dispatcher, and a worker claims them a little after each dispatcher poll. With `burst: 1`, `τ` is 0. Admitting a job sets `tat` to its claim time plus `T`, but the next waiting job's slot was set one `T` after the previous slot. It arrives at its slot plus its own delay, so it's admitted only if its delay is at least the previous job's. Otherwise it gets the slot after all the others, and the slot it missed goes unused.
 
-Delays come from the dispatcher's poll and the worker's poll, and they vary by up to the worker's polling interval. Lowering the dispatcher's `polling_interval` doesn't help, because the delays still vary. Against a real supervisor on SQLite, with one worker polling every 0.1 seconds, `to: 1, per: 1.second` drained a backlog at 0.55 jobs per second with a 1-second dispatcher poll, and at 0.53 with a 0.1-second one. `burst: 2` drained it at 0.95 and 1.0.
+Delays come from the dispatcher's poll and the worker's poll, and they vary by up to the worker's polling interval. Lowering the dispatcher's `polling_interval` doesn't help, because the delays still vary. Against a real supervisor on SQLite, with one worker polling every 0.1 seconds, `to: 1, per: 1.second` drained a backlog at 0.55 jobs per second with a 1-second dispatcher poll, and at 0.53 with a 0.1-second one. `to: 2, burst: 2`, which has the same `T`, drained it at 0.95 and 1.0.
 
-A dispatcher poll also makes about `to × polling_interval / per` jobs due at once, and one claim takes them together, so the budget has to admit that many at once. The slack on top has to cover the variation in claim delays, up to the worker's polling interval, which is `to × worker polling_interval / per` intervals. That's the rule of thumb in the README: `burst >= to × (dispatcher polling_interval + worker polling_interval) / per`, rounded up, and at least 2. The recipe test replays it with fixed delays in simulated time. It isn't a bound, because a slow claim can vary its delay by more than a polling interval.
+A dispatcher poll also makes about `polling_interval / T` jobs due at once, and one claim takes them together, so the budget has to admit that many at once. The slack on top has to cover the variation in claim delays, up to the worker's polling interval, which is `worker polling_interval / T` intervals. That's the rule of thumb in the README: `burst >= (dispatcher polling_interval + worker polling_interval) / T`, rounded up, and at least 2. With `p` for the two added up, `T = per / (to - burst + 1)` gives `burst >= (to + 1) × p / (per + p)`. A result above `to` means `per` is too short for the polls. The recipe test replays it with fixed delays in simulated time. It isn't a bound, because a slow claim can vary its delay by more than a polling interval.
 
 ## Alternatives considered
 
@@ -290,7 +292,8 @@ A dispatcher poll also makes about `to × polling_interval / per` jobs due at on
 - **Computing the key at claim.** It would need the job's arguments deserialized, and records loaded, inside the claim's transaction. A record deleted in the meantime would fail the claim, or every claim that took the job.
 - **A key column, or a table linking jobs to keys.** Either would let a claim skip parsing the payload, but needs a migration and changes to Solid Queue's tables or a write per enqueue. Parsing the payload costs only limited jobs.
 - **Sleeping in `perform`, or `retry_on` after a 429.** Both tie up worker threads or create retries, and neither holds across workers. This is what the gem replaces.
-- **Exact sliding windows or token buckets.** An exact window needs a row per admission. GCRA needs one timestamp per limit, and its error bound, `burst + floor(w / T)`, is easy to state.
+- **Exact sliding windows or token buckets.** An exact window needs a row per admission. It would admit `to` in any clumps, so a backlog could drain at `to` per `per`, where GCRA gives up `burst - 1` of it. GCRA needs one timestamp per limit, and its bound, at most `to` in any `per`, is easy to state.
+- **`to:` as the steady rate.** With `T = per / to`, a backlog drains at `to` per `per`, but a burst comes on top of it, so `to:` isn't the most a window holds. That reads wrongly next to Rails' `rate_limit to:` and `limits_concurrency to:`, which are caps, and quotas are what an API states.
 - **Deferring without staggering, or without a cap.** Without staggering, a backlog bounces between scheduled and ready on every poll. See [Deferral and staggering](#deferral-and-staggering). Without a cap, discarded jobs or a loosened limit could strand capacity for as long as the backlog.
 
 ## Open doubts
@@ -298,7 +301,7 @@ A dispatcher poll also makes about `to × polling_interval / per` jobs due at on
 - Capped staggering on a large, slow backlog isn't stress-tested. With 10,000 jobs at 1 per minute, 5 jobs hold slots and the rest come back every 5 minutes, about 33 dispatches and deferrals a second for nothing.
 - On Rails 7.x, SQLite transactions are DEFERRED, so a claim starts as a reader and upgrades to a writer. The dummy app opens IMMEDIATE transactions on every Rails version, so the suite has never run claims on Rails 7.x's default.
 - On PostgreSQL, the cleanup's `DELETE` locks rows in scan order, not key order, so it can deadlock with a claim that holds several keys. One of them is rolled back, and the cleanup runs again at its next schedule. Testing hasn't shown it.
-- With `burst: 1`, a backlog drains at about half to nine tenths of the rate. See [Throughput with a small burst](#throughput-with-a-small-burst). [#6](https://github.com/dtcristo/solid_queue-rate_limit/issues/6) is the place to change that.
+- With `burst: 1`, a backlog drains at about half to nine tenths of `to` per `per`. See [Throughput with a small burst](#throughput-with-a-small-burst). [#6](https://github.com/dtcristo/solid_queue-rate_limit/issues/6) is the place to change that.
 
 ## Where it lives
 

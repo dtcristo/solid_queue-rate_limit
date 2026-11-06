@@ -7,7 +7,7 @@ class SolidQueue::RateLimitPendingMigrationsTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   class LimitedJob < ApplicationJob
-    limits_rate to: 1, per: 1.minute, burst: 2, key: :global
+    limits_rate to: 2, per: 1.minute, burst: 2, key: :global
 
     def perform(value)
       JobBuffer.add(value)

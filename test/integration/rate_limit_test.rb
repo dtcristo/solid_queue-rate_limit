@@ -6,8 +6,8 @@ require "test_helper"
 class RateLimitTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
-  class TenASecondJob < ApplicationJob
-    limits_rate to: 10, per: 1.second, burst: 3, key: :global
+  class TwelveASecondJob < ApplicationJob
+    limits_rate to: 12, per: 1.second, burst: 3, key: :global
 
     def perform(value)
       JobResult.create!(queue_name: "default", status: "limited", value: value)
@@ -24,7 +24,7 @@ class RateLimitTest < ActiveSupport::TestCase
   # A claim starts some time after that, so timing claims would misjudge the rate.
   module RecordAdmissions
     def admit(interval, burst, now)
-      super.tap { |admitted| (Thread.current[:rate_limit_test_admissions] ||= []) << now.to_r if admitted && key == "#{TenASecondJob.name}/global" }
+      super.tap { |admitted| (Thread.current[:rate_limit_test_admissions] ||= []) << now.to_r if admitted && key == "#{TwelveASecondJob.name}/global" }
     end
   end
 
@@ -60,7 +60,7 @@ class RateLimitTest < ActiveSupport::TestCase
   end
 
   test "workers claim limited jobs at the rate, and every job runs" do
-    limited = Array.new(30) { |i| TenASecondJob.new(i) }
+    limited = Array.new(30) { |i| TwelveASecondJob.new(i) }
     ActiveJob.perform_all_later(limited + Array.new(20) { |i| UnlimitedJob.new(i) })
 
     wait_for_jobs_to_finish_for(10.seconds)
@@ -70,7 +70,7 @@ class RateLimitTest < ActiveSupport::TestCase
 
     assert_equal 30, times.size
     assert_operator times.each_cons(4).map { |first, *, last| last - first }.min, :>=, Rational(1, 10), "after a burst of 3, the 4th admission waits an interval"
-    assert_operator times.map { |t0| times.count { |t| t >= t0 && t < t0 + 1 } }.max, :<=, 3 + 10
+    assert_operator times.map { |t0| times.count { |t| t >= t0 && t < t0 + 1 } }.max, :<=, 12, "any second admits at most to"
     assert_operator times.last - times.first, :<=, (30 - 3) * 0.1 + 1.5
 
     assert_equal (0...30).to_a, JobResult.where(status: "limited").pluck(:value).map(&:to_i).sort
