@@ -16,7 +16,7 @@ flowchart LR
     Claimed --> Perform["perform"]
 ```
 
-At enqueue the gem only checks that the table exists, and works out the key of a job whose class declares `key:` or `group:`. Nothing happens when a job runs. The whole limit lives in one step of the claim.
+At enqueue the gem only checks that the table exists, and works out the job's key. Nothing happens when a job runs. The whole limit lives in one step of the claim.
 
 ## Terms
 
@@ -26,7 +26,7 @@ At enqueue the gem only checks that the table exists, and works out the key of a
 | Pass | One run of Solid Queue's `select_and_lock`: select and lock candidates, then claim them |
 | Candidate | A ready execution that a pass has locked with `SKIP LOCKED` |
 | Budget | One GCRA state, shared by every job with the same key |
-| Key | The name of a budget's state row. The class's name, unless the class declares `key:` or `group:` |
+| Key | The name of a budget's state row, built from the class's `group:` and `key:` |
 | Group | What `group:` names, so several classes share their budgets. Defaults to the class's name |
 | `T` | The interval between admissions, `per / to` |
 | `τ` | The slack a burst gives, `(burst - 1) × T` |
@@ -51,23 +51,23 @@ The limit comes from the job's class, found through `solid_queue_jobs.class_name
 
 This keeps enqueues cheap and lets a deploy change a limit for jobs already waiting. The cost is that a worker has to load the class to know its limit. See [Class load failures](#class-load-failures). Workers with different settings for one class, during a rolling deploy, share the class's state and each apply their own.
 
-Without `key:` or `group:`, the state's key is the class's name, read from the loaded class, not from the job row. A job enqueued under an alias constant shares its class's budget.
+The state's key is stored with the job at enqueue, from the class that enqueued it, so a job enqueued under an alias constant shares its class's budget.
 
 ## Keys and groups
 
-`key:` and `group:` take what `limits_concurrency` takes, and the key is built the way Solid Queue's `concurrency_key` is: `[group, param].compact.join("/")`. The group defaults to the class's name, and a record param becomes its class name and id. Both go through Solid Queue's own `compute_concurrency_parameter`, so a String or Symbol is used as it is, a Proc runs with the job's arguments, and anything else is `nil`. A key that comes out blank isn't stored, so the job uses its class's budget.
+`key:` is required and `group:` is optional, as in `limits_concurrency`, and they take what it takes. The key is built the way Solid Queue's `concurrency_key` is: `[group, param].compact.join("/")`. The group defaults to Solid Queue's `->(*) { self.class.name }`, an explicit `nil` group leaves it out, and a record param becomes its class name and id. Both go through Solid Queue's own `compute_concurrency_parameter`, so a String or Symbol is used as it is, a Proc runs with the job's arguments, and anything else is `nil`. A key that comes out blank, from `group: nil` and a key that's `nil`, is stored, and the claim admits the job without a check, as Solid Queue doesn't limit a job whose concurrency key is blank. A `nil` or `false` declaration turns the limit off, as it turns off `limits_concurrency`, so `rate_limited?` reads the key, not `to:`. A test checks the keys against `concurrency_key` for each kind of declaration.
 
-The key is computed in `serialize`, only for a class that declares `key:` or `group:` and only when the class's adapter is Solid Queue, the check solid_queue-coalesce uses. Solid Queue calls `serialize` inside `Job.enqueue`, so a Proc that raises fails the enqueue, and `perform_now` and other adapters never run it. The key goes into the job's serialized data as `"solid_queue_rate_limit_key"`, named like Solid Queue's `"solid_queue_concurrency_lock"`. `deserialize` reads it back, and `serialize` keeps a key it already has, so a `retry_on` retry, including one after the arguments failed to deserialize, keeps the key without running the Proc again. A failed job you retry keeps its row, and with it its key.
+The key is computed in `serialize`, only for a limited class and only when the class's adapter is Solid Queue, the check solid_queue-coalesce uses. Solid Queue calls `serialize` inside `Job.enqueue`, so a Proc that raises fails the enqueue, and `perform_now` and other adapters never run it. The key goes into the job's serialized data as `"solid_queue_rate_limit_key"`, named like Solid Queue's `"solid_queue_concurrency_lock"`. `deserialize` reads it back, and `serialize` keeps a key it already has, so a `retry_on` retry, including one after the arguments failed to deserialize, keeps the key without running the Proc again. A failed job you retry keeps its row, and with it its key. A job without a stored key gets the class's current key the next time it's serialized, such as when it's retried.
 
 The state table's `key` column limits how long a key can be. On MySQL that's 255 characters, and `serialize` raises `ActiveRecord::ValueTooLong` for a longer key, so it can't fail claims later. Solid Queue wraps it in `EnqueueError` for `perform_later` and lets it through for `perform_all_later`, as it does for an over-long `concurrency_key`. PostgreSQL and SQLite report no limit.
 
-At claim, after the classes have loaded, the gem reads `arguments` only for limited jobs whose class declares `key:` or `group:`, in one query per pass, and takes the stored key. Claims of other jobs run the same queries as in 0.1.0, and a test checks the list. A job with no stored key, such as one enqueued before its class declared `key:`, uses its class's name. So does a job whose class stopped declaring them. A class that's no longer limited isn't limited, whatever its jobs stored.
+At claim, after the classes have loaded, the gem reads `arguments` for the limited jobs, in one query per pass, and takes the stored key. A test checks the claim's queries. A job with no stored key, such as one enqueued before its class declared a limit or by 0.1.0, uses its class's name. A job keeps its stored key when its class changes `key:` or `group:`. A class that's no longer limited isn't limited, whatever its jobs stored.
 
 Each job is charged with its own class's settings, against the state of its key. Classes in a group are meant to declare the same settings, but the gem doesn't check, as Solid Queue doesn't for concurrency groups. Mixed settings can admit more than the stricter one allows.
 
 Keys aren't tagged or escaped, like concurrency keys, so a group named after a job class shares that class's budget, and `/` inside a value can make two keys collide. The README documents this instead of preventing it.
 
-Reading the key from `arguments` parses the whole JSON payload, which costs more for large payloads. Only keyed jobs pay it. See [Alternatives considered](#alternatives-considered).
+Reading the key from `arguments` parses the whole JSON payload, which costs more for large payloads. Only limited jobs pay it. See [Alternatives considered](#alternatives-considered).
 
 ## Table
 
@@ -218,7 +218,7 @@ A row with `tat` in the past but slots ahead is kept. Deleting it would hand tho
 
 Each batch reads idle keys, then deletes them with the idle condition repeated in the `DELETE`. A claim that charges a row in between moves its `tat` past now, so the `DELETE` skips it. On PostgreSQL and MySQL, a `DELETE` that waits for a claim's lock checks the row's committed version once the claim commits. A single `DELETE` with a `LIMIT` subquery, which is what Active Record builds on PostgreSQL and SQLite, would only check the subquery's rows as they were. The delete matches by key, so on MySQL it locks rows through the key index, in key order, as claims do.
 
-The cleanup races claims the other way too. `lock_all` reads which keys exist without locking, and the cleanup can delete a row after that read, so the locking read misses it. `lock_all` then locks that key alone and inserts it again if it's gone, which is also how it finds a row spelled differently under a case-insensitive collation. That lock is taken out of key order, so it can deadlock with another claim. It only happens when the cleanup deletes a row in the moment between a claim's two reads, and the deadlock is handled as any other. See [Deadlocks](#deadlocks). Claims where every row exists run the same queries as in 0.1.0.
+The cleanup races claims the other way too. `lock_all` reads which keys exist without locking, and the cleanup can delete a row after that read, so the locking read misses it. `lock_all` then locks that key alone and inserts it again if it's gone, which is also how it finds a row spelled differently under a case-insensitive collation. That lock is taken out of key order, so it can deadlock with another claim. It only happens when the cleanup deletes a row in the moment between a claim's two reads, and the deadlock is handled as any other. See [Deadlocks](#deadlocks). Claims where every row exists insert none.
 
 ## Fast path
 
@@ -288,7 +288,7 @@ A dispatcher poll also makes about `to × polling_interval / per` jobs due at on
 - **Slots worked out at enqueue.** Setting `scheduled_at` when a job is enqueued would reserve future capacity. A cancelled job or a loosened limit would strand it, and retries would need their own slots. Waiting at claim keeps reservations as hints that can't strand anything for more than 5 minutes.
 - **Recording each job's limit at enqueue.** An assignments table would let a worker skip loading the class. It costs a write per enqueue, and a loosened limit wouldn't reach jobs already waiting. The key is stored with the job instead, in the payload Solid Queue already writes, and the settings still come from the class.
 - **Computing the key at claim.** It would need the job's arguments deserialized, and records loaded, inside the claim's transaction. A record deleted in the meantime would fail the claim, or every claim that took the job.
-- **A key column, or a table linking jobs to keys.** Either would let a claim skip parsing the payload, but needs a migration and changes to Solid Queue's tables or a write per enqueue. Parsing the payload costs only keyed jobs.
+- **A key column, or a table linking jobs to keys.** Either would let a claim skip parsing the payload, but needs a migration and changes to Solid Queue's tables or a write per enqueue. Parsing the payload costs only limited jobs.
 - **Sleeping in `perform`, or `retry_on` after a 429.** Both tie up worker threads or create retries, and neither holds across workers. This is what the gem replaces.
 - **Exact sliding windows or token buckets.** An exact window needs a row per admission. GCRA needs one timestamp per limit, and its error bound, `burst + floor(w / T)`, is easy to state.
 - **Deferring without staggering, or without a cap.** Without staggering, a backlog bounces between scheduled and ready on every poll. See [Deferral and staggering](#deferral-and-staggering). Without a cap, discarded jobs or a loosened limit could strand capacity for as long as the backlog.
@@ -304,7 +304,7 @@ A dispatcher poll also makes about `to × polling_interval / per` jobs due at on
 
 | Idea | File | Names |
 | --- | --- | --- |
-| Declaring `limits_rate`, and refusing `on_conflict: :discard` with it | `lib/active_job/rate_controls.rb` | `limits_rate`, `rate_limited?`, `rate_limit_keyed?`, `rate_limit_interval`, `limits_concurrency`, `ensure_rate_limit_compatible_with_concurrency_controls` |
+| Declaring `limits_rate`, and refusing `on_conflict: :discard` with it | `lib/active_job/rate_controls.rb` | `limits_rate`, `rate_limited?`, `rate_limit_interval`, `limits_concurrency`, `ensure_rate_limit_compatible_with_concurrency_controls` |
 | Building and storing a job's key | `lib/active_job/rate_controls.rb` | `serialize`, `deserialize`, `rate_limit_key`, `RATE_LIMIT_KEY` |
 | Admission, deferral and scheduling | `app/models/solid_queue/ready_execution/rate_limited.rb` | `defer_rate_limited`, `rate_limit_keys`, `check_rate_limits`, `schedule_rate_limited`, `rate_limited_job_class` |
 | Giving a deferred job's semaphore back and waking a blocked job | `app/models/solid_queue/ready_execution/rate_limited.rb`, `lib/solid_queue/rate_limit/patches.rb` | `hold_concurrency_locks`, `release_concurrency_locks`, `releasing_concurrency_locks` |

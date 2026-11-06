@@ -9,7 +9,7 @@ class SolidQueue::RateLimitCoalesceTest < ActiveSupport::TestCase
 
   class DiscardingJob < ApplicationJob
     coalesce key: ->(account) { account }
-    limits_rate to: 1, per: 10.seconds, group: "CoalesceTest"
+    limits_rate to: 1, per: 10.seconds, group: "CoalesceTest", key: :global
 
     def perform(account)
       JobBuffer.add(account)
@@ -18,7 +18,7 @@ class SolidQueue::RateLimitCoalesceTest < ActiveSupport::TestCase
 
   class CollectingJob < ApplicationJob
     coalesce key: ->(account, _id) { account }, on_conflict: :collect, max_calls: 3
-    limits_rate to: 1, per: 10.seconds, group: "CoalesceTest"
+    limits_rate to: 1, per: 10.seconds, group: "CoalesceTest", key: :global
 
     def perform_calls(calls)
       JobBuffer.add(calls.map { |call| call.arguments.last })
@@ -27,14 +27,14 @@ class SolidQueue::RateLimitCoalesceTest < ActiveSupport::TestCase
 
   class DispatchingJob < ApplicationJob
     coalesce key: ->(account, _id) { account }, on_conflict: :collect, max_calls: 2, on_full: :dispatch
-    limits_rate to: 1, per: 10.seconds, group: "CoalesceTest"
+    limits_rate to: 1, per: 10.seconds, group: "CoalesceTest", key: :global
 
     def perform_calls(calls); end
   end
 
   class DebouncedJob < ApplicationJob
     coalesce key: ->(account) { account }, debounce: 5.seconds
-    limits_rate to: 1, per: 30.seconds, group: "CoalesceTestSlow"
+    limits_rate to: 1, per: 30.seconds, group: "CoalesceTestSlow", key: :global
 
     def perform(account)
       JobBuffer.add(account)
@@ -42,7 +42,7 @@ class SolidQueue::RateLimitCoalesceTest < ActiveSupport::TestCase
   end
 
   class SlowLimitedJob < ApplicationJob
-    limits_rate to: 1, per: 30.seconds, group: "CoalesceTestSlow"
+    limits_rate to: 1, per: 30.seconds, group: "CoalesceTestSlow", key: :global
 
     def perform; end
   end
@@ -50,7 +50,7 @@ class SolidQueue::RateLimitCoalesceTest < ActiveSupport::TestCase
   class SyncAccountJob < ApplicationJob
     coalesce key: ->(account) { account }
     limits_concurrency key: ->(account) { account }
-    limits_rate to: 1, per: 10.seconds, group: "CoalesceTest"
+    limits_rate to: 1, per: 10.seconds, group: "CoalesceTest", key: :global
 
     cattr_accessor :during_perform
 

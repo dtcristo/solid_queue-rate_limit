@@ -8,20 +8,20 @@ class SolidQueue::RateLimitStaggerTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   class EverySecondJob < ApplicationJob
-    limits_rate to: 1, per: 1.second
+    limits_rate to: 1, per: 1.second, key: :global
 
     def perform; end
   end
 
   # Enough burst for a dispatcher that polls every second: to × polling_interval / per = 2
   class TwiceASecondJob < ApplicationJob
-    limits_rate to: 2, per: 1.second, burst: 4
+    limits_rate to: 2, per: 1.second, burst: 4, key: :global
 
     def perform; end
   end
 
   class EveryMinuteJob < ApplicationJob
-    limits_rate to: 1, per: 1.minute
+    limits_rate to: 1, per: 1.minute, key: :global
 
     def perform; end
   end

@@ -7,13 +7,13 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   class TenASecondJob < ApplicationJob
-    limits_rate to: 10, per: 1.second, burst: 3
+    limits_rate to: 10, per: 1.second, burst: 3, key: :global
 
     def perform; end
   end
 
   class FiveASecondJob < ApplicationJob
-    limits_rate to: 5, per: 1.second, burst: 2
+    limits_rate to: 5, per: 1.second, burst: 2, key: :global
 
     def perform; end
   end
@@ -35,7 +35,7 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
   # long enough that two runs for one account would overlap.
   class SyncAccountJob < ApplicationJob
     limits_concurrency key: ->(account) { account }
-    limits_rate to: 10, per: 1.second, burst: 3
+    limits_rate to: 10, per: 1.second, burst: 3, key: :global
 
     cattr_accessor :runs
 
@@ -108,7 +108,7 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
     errors = run_workers_and_dispatcher(until_done: job_classes.size, timeout: 15.seconds)
 
     assert_empty errors
-    assert_claimed_once_within_limits job_classes, SyncAccountJob.name => [ SyncAccountJob, 30 ]
+    assert_claimed_once_within_limits job_classes, "#{SyncAccountJob.name}/global" => [ SyncAccountJob, 30 ]
 
     runs = Array.new(SyncAccountJob.runs.size) { SyncAccountJob.runs.pop }
     assert_equal 30, runs.size
@@ -165,7 +165,7 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
     # Two limited classes in overlapping batches, and unlimited jobs among them.
     # One limit's state exists already, and the other's is created by the claims.
     def enqueue_jobs
-      SolidQueue::RateLimitState.create!(key: TenASecondJob.name, tat: Time.current)
+      SolidQueue::RateLimitState.create!(key: "#{TenASecondJob.name}/global", tat: Time.current)
 
       ActiveJob.perform_all_later(Array.new(30) { TenASecondJob.new } + Array.new(15) { FiveASecondJob.new } + Array.new(30) { UnlimitedJob.new })
       ActiveJob.perform_all_later(Array.new(30) { [ TenASecondJob.new, FiveASecondJob.new, UnlimitedJob.new ].sample })
@@ -177,8 +177,8 @@ class SolidQueue::RateLimitConcurrencyTest < ActiveSupport::TestCase
     # The limits enqueue_jobs sets up, each with the class it's charged with and how many jobs it admits
     def enqueued_limits(job_classes)
       {
-        TenASecondJob.name => [ TenASecondJob, job_classes.values.count(TenASecondJob.name) ],
-        FiveASecondJob.name => [ FiveASecondJob, job_classes.values.count(FiveASecondJob.name) ],
+        "#{TenASecondJob.name}/global" => [ TenASecondJob, job_classes.values.count(TenASecondJob.name) ],
+        "#{FiveASecondJob.name}/global" => [ FiveASecondJob, job_classes.values.count(FiveASecondJob.name) ],
         "Grouped/a" => [ GroupedJob, 10 ],
         "Grouped/b" => [ GroupedJob, 10 ]
       }

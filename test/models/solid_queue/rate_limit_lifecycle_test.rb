@@ -7,7 +7,7 @@ class SolidQueue::RateLimitLifecycleTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   class LimitedJob < ApplicationJob
-    limits_rate to: 1, per: 10.seconds
+    limits_rate to: 1, per: 10.seconds, key: :global
 
     def perform(value)
       JobBuffer.add(value)
@@ -15,7 +15,7 @@ class SolidQueue::RateLimitLifecycleTest < ActiveSupport::TestCase
   end
 
   class RetryingJob < ApplicationJob
-    limits_rate to: 1, per: 10.seconds
+    limits_rate to: 1, per: 10.seconds, key: :global
     retry_on ExpectedTestError, wait: 0, attempts: 2
 
     def perform
@@ -25,7 +25,7 @@ class SolidQueue::RateLimitLifecycleTest < ActiveSupport::TestCase
   end
 
   class FailingJob < ApplicationJob
-    limits_rate to: 1, per: 10.seconds
+    limits_rate to: 1, per: 10.seconds, key: :global
 
     def perform
       raise ExpectedTestError
