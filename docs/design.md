@@ -41,7 +41,7 @@ The gem prepends two private class methods of `SolidQueue::ReadyExecution`:
 - `lock_candidates(executions, process_id)` gets the candidates once `select_candidates` has locked them, inside the pass's transaction. The gem splits off the jobs over their limit, schedules them, deletes their ready rows and passes the rest to Solid Queue.
 - `select_and_lock(queue_relation, process_id, limit)` runs a pass. The gem runs more passes when one deferred jobs. See [Refill](#refill).
 
-`lock_candidates` is the one place where the candidates are known and locked, and nothing has been claimed yet. Admission there is atomic with the claim, so a rolled-back claim rolls back its charges too. The seam is byte-identical from Solid Queue 1.7.0 to 1.7.2. The gemspec requires `>= 1.7.2, < 1.8`, because each minor has to be checked again, and because 1.7.2 records which semaphore a job holds. See [Concurrency keys](#concurrency-keys). [#9](https://github.com/dtcristo/solid_queue-rate_limit/issues/9) is about proposing a public hook upstream.
+`lock_candidates` is the one place where the candidates are known and locked, and nothing has been claimed yet. Admission there is atomic with the claim, so a rolled-back claim rolls back its charges too. The seam is byte-identical from Solid Queue 1.7.0 to 1.7.2. The gemspec requires `~> 1.7.0`, because each minor has to be checked again. See [Concurrency keys](#concurrency-keys) for what 1.7.2 changes. [#9](https://github.com/dtcristo/solid_queue-rate_limit/issues/9) is about proposing a public hook upstream.
 
 The patches are applied from the engine's `to_prepare`, because Solid Queue's models are reloadable.
 
@@ -256,7 +256,7 @@ Holding the semaphore while the job waits was rejected. A backlog can defer a jo
 
 Only the claim that locked a ready row can release that row's semaphore, because it deletes the row in the same transaction, and it releases it once, after the commit. Every other path that signals a semaphore, `before_destroy` on a ready job, `ClaimedExecution#finalize` and `ReadyExecution.discard_jobs`, needs a ready or claimed row. Only a new dispatch creates one, and a new dispatch takes the semaphore again and records it. A scheduled or blocked job never signals, so discarding a deferred job, or one that came back and was blocked, leaves the semaphore alone.
 
-Solid Queue 1.7.2 records the semaphore a job holds in `"solid_queue_concurrency_lock"`, and the release relies on it. A job that recorded no semaphore, because its class didn't load when it was dispatched, gives none back. A job whose semaphore expired and was replaced leaves the new one alone. The record stays on a released job, which saves a write to `jobs.arguments` for each deferral, and the next dispatch overwrites it.
+Solid Queue 1.7.2 records the semaphore a job holds in `"solid_queue_concurrency_lock"`, and the release relies on it. Before 1.7.2, Solid Queue gives a slot back to whichever semaphore the key has, so a job whose semaphore expired and was replaced gives its slot to the new one, as Solid Queue does when a job runs past its `duration`. A job that recorded no semaphore, because its class didn't load when it was dispatched, gives none back. A job whose semaphore expired and was replaced leaves the new one alone. The record stays on a released job, which saves a write to `jobs.arguments` for each deferral, and the next dispatch overwrites it.
 
 ### Discarding on conflict
 
