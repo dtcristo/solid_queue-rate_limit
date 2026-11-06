@@ -61,6 +61,15 @@ class SolidQueue::RateLimitCoalesceTest < ActiveSupport::TestCase
     end
   end
 
+  # Shares SyncAccountStateJob's concurrency slots, without coalescing or a rate
+  class OtherAccountWorkJob < ApplicationJob
+    limits_concurrency key: ->(account) { account }, group: SyncAccountStateJob.name
+
+    def perform(account)
+      JobBuffer.add([ account, :other ])
+    end
+  end
+
   class DebouncedJob < ApplicationJob
     coalesce key: ->(account) { account }, debounce: 5.seconds
     limits_rate to: 1, per: 30.seconds, group: "CoalesceTestSlow", key: :global
@@ -190,21 +199,22 @@ class SolidQueue::RateLimitCoalesceTest < ActiveSupport::TestCase
     assert_equal [ [ "spent", "free" ], [ "spent", "pro" ], [ "a", "pro" ] ], JobBuffer.values
   end
 
-  test "a replacing job over the rate gives its concurrency slot back, and comes back with the latest arguments" do
+  test "a replacing job over the rate gives its concurrency slot back while it waits, and comes back with the latest arguments" do
     SyncAccountStateJob.perform_later("a", 1)
     job = SyncAccountStateJob.perform_later("b", 1)
+    OtherAccountWorkJob.perform_later("b")
     perform_claimed
     assert SolidQueue::ScheduledExecution.exists?(job_id: job.provider_job_id)
-    assert_equal 1, SolidQueue::Semaphore.find_by!(key: "#{self.class.name}::SyncAccountStateJob/b").value
+
+    perform_claimed
+    assert_equal [ [ "a", 1 ], [ "b", :other ] ], JobBuffer.values
 
     assert_equal :replaced, SyncAccountStateJob.perform_later("b", 2).coalesce_status
 
     travel 10.seconds
     SolidQueue::ScheduledExecution.dispatch_next_batch(10)
     perform_claimed
-
-    assert_equal [ [ "a", 1 ], [ "b", 2 ] ], JobBuffer.values
-    assert_equal 0, SolidQueue::Semaphore.where("value < 1").count
+    assert_equal [ [ "a", 1 ], [ "b", :other ], [ "b", 2 ] ], JobBuffer.values
   end
 
   test "debounce moves a job waiting on the rate only to a later time, so it runs at the later of the two" do
