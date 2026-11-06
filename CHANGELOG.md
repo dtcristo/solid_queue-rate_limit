@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- CI tests [Solid Queue Coalesce](https://github.com/dtcristo/solid_queue-coalesce) 0.3 alongside, including `on_conflict: :replace`: a job waiting on the rate takes replacements and runs once with the latest arguments, keeps the rate limit key of the call that created it, and gives its concurrency slot back while it waits. ([#30](https://github.com/dtcristo/solid_queue-rate_limit/pull/30))
+
 ## [0.2.1] - 2026-11-06
 
 Allows Solid Queue 1.7.0 and 1.7.1 again, and CI now tests every 1.7 release and Solid Queue main. Upgrading from 0.2.0 takes no work. On Solid Queue before 1.7.2, a job that combines `limits_rate` with `limits_concurrency` can let one extra job run for its key, as in Solid Queue itself, so upgrade Solid Queue to 1.7.2 to avoid that.

@@ -32,7 +32,7 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency "pg"
   spec.add_development_dependency "sqlite3"
   spec.add_development_dependency "rubocop-rails-omakase"
-  spec.add_development_dependency "solid_queue-coalesce", "~> 0.2.0"
+  spec.add_development_dependency "solid_queue-coalesce", "~> 0.3.0"
   spec.add_development_dependency "rdoc"
   spec.add_development_dependency "logger"
 end
