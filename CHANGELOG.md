@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-06
+
+Allows Solid Queue 1.7.0 and 1.7.1 again, and CI now tests every 1.7 release and Solid Queue main. Upgrading from 0.2.0 takes no work. On Solid Queue before 1.7.2, a job that combines `limits_rate` with `limits_concurrency` can let one extra job run for its key, as in Solid Queue itself, so upgrade Solid Queue to 1.7.2 to avoid that.
+
 ### Changed
 
 - Allows Solid Queue 1.7.0 and 1.7.1 again, as 0.1.0 did. Combining `limits_rate` with `limits_concurrency` works on them as Solid Queue does: a deferred job whose semaphore expired can let one more job than the limit run, which Solid Queue 1.7.2 fixes. CI tests each 1.7 release and Solid Queue main, and runs each Ruby with one Rails instead of with every Rails. ([#28](https://github.com/dtcristo/solid_queue-rate_limit/pull/28))
@@ -47,6 +51,7 @@ The first release adds `limits_rate`, so workers claim a job class's jobs no fas
 - Requires Solid Queue 1.7. ([#11](https://github.com/dtcristo/solid_queue-rate_limit/pull/11))
 - A README with recipes, the guarantee and a rule for picking `burst`, and [design notes](https://github.com/dtcristo/solid_queue-rate_limit/blob/main/docs/design.md). ([#13](https://github.com/dtcristo/solid_queue-rate_limit/pull/13))
 
-[Unreleased]: https://github.com/dtcristo/solid_queue-rate_limit/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/dtcristo/solid_queue-rate_limit/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/dtcristo/solid_queue-rate_limit/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/dtcristo/solid_queue-rate_limit/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/dtcristo/solid_queue-rate_limit/releases/tag/v0.1.0
