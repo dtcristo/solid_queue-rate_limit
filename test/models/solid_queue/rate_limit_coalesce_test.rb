@@ -32,6 +32,35 @@ class SolidQueue::RateLimitCoalesceTest < ActiveSupport::TestCase
     def perform_calls(calls); end
   end
 
+  class ReplacingJob < ApplicationJob
+    coalesce key: ->(account, _state) { account }, on_conflict: :replace
+    limits_rate to: 1, per: 10.seconds, group: "CoalesceTest", key: :global
+
+    def perform(account, state)
+      JobBuffer.add([ account, state ])
+    end
+  end
+
+  # Charged to a budget for each plan, so a replacement on another plan shows which one the job keeps
+  class ReplacingPlanJob < ApplicationJob
+    coalesce key: ->(account, _plan) { account }, on_conflict: :replace
+    limits_rate to: 1, per: 10.seconds, key: ->(_account, plan) { plan }
+
+    def perform(account, plan)
+      JobBuffer.add([ account, plan ])
+    end
+  end
+
+  class SyncAccountStateJob < ApplicationJob
+    coalesce key: ->(account, _state) { account }, on_conflict: :replace
+    limits_concurrency key: ->(account, _state) { account }
+    limits_rate to: 1, per: 10.seconds, group: "CoalesceTest", key: :global
+
+    def perform(account, state)
+      JobBuffer.add([ account, state ])
+    end
+  end
+
   class DebouncedJob < ApplicationJob
     coalesce key: ->(account) { account }, debounce: 5.seconds
     limits_rate to: 1, per: 30.seconds, group: "CoalesceTestSlow", key: :global
@@ -124,6 +153,58 @@ class SolidQueue::RateLimitCoalesceTest < ActiveSupport::TestCase
 
     assert_empty claim
     assert SolidQueue::ScheduledExecution.exists?(job_id: job.provider_job_id)
+  end
+
+  test "a replacing job waiting on the rate takes later calls' arguments, and runs once with the latest" do
+    ReplacingJob.perform_later("a", 1)
+    job = ReplacingJob.perform_later("b", 1)
+    perform_claimed
+    assert SolidQueue::ScheduledExecution.exists?(job_id: job.provider_job_id)
+
+    later = [ 2, 3 ].map { |state| ReplacingJob.perform_later("b", state) }
+    assert_equal [ :replaced, :replaced ], later.map(&:coalesce_status)
+
+    travel 10.seconds
+    SolidQueue::ScheduledExecution.dispatch_next_batch(10)
+    perform_claimed
+
+    assert_equal [ [ "a", 1 ], [ "b", 3 ] ], JobBuffer.values
+    assert_equal 2, SolidQueue::Job.count
+  end
+
+  test "a replacement keeps the rate limit key of the call that created the job" do
+    ReplacingPlanJob.perform_later("spent", "free")
+    perform_claimed
+    job = ReplacingPlanJob.perform_later("a", "free")
+    assert_empty claim
+
+    # The pro budget is spent until 15 seconds, after the free one comes back at 10
+    travel 5.seconds
+    ReplacingPlanJob.perform_later("spent", "pro")
+    perform_claimed
+    assert_equal :replaced, ReplacingPlanJob.perform_later("a", "pro").coalesce_status
+
+    travel 5.seconds
+    SolidQueue::ScheduledExecution.dispatch_next_batch(10)
+    assert_equal [ job.provider_job_id ], claim.each(&:perform).map(&:job_id)
+    assert_equal [ [ "spent", "free" ], [ "spent", "pro" ], [ "a", "pro" ] ], JobBuffer.values
+  end
+
+  test "a replacing job over the rate gives its concurrency slot back, and comes back with the latest arguments" do
+    SyncAccountStateJob.perform_later("a", 1)
+    job = SyncAccountStateJob.perform_later("b", 1)
+    perform_claimed
+    assert SolidQueue::ScheduledExecution.exists?(job_id: job.provider_job_id)
+    assert_equal 1, SolidQueue::Semaphore.find_by!(key: "#{self.class.name}::SyncAccountStateJob/b").value
+
+    assert_equal :replaced, SyncAccountStateJob.perform_later("b", 2).coalesce_status
+
+    travel 10.seconds
+    SolidQueue::ScheduledExecution.dispatch_next_batch(10)
+    perform_claimed
+
+    assert_equal [ [ "a", 1 ], [ "b", 2 ] ], JobBuffer.values
+    assert_equal 0, SolidQueue::Semaphore.where("value < 1").count
   end
 
   test "debounce moves a job waiting on the rate only to a later time, so it runs at the later of the two" do
