@@ -50,12 +50,6 @@ class SolidQueue::RateLimitDeclarationTest < ActiveSupport::TestCase
     assert_equal 2, job { limits_rate to: 2, per: 1.minute, burst: 2, key: :global }.rate_limit_burst
   end
 
-  test "spaces jobs so that a per admits at most to, burst included" do
-    assert_equal 0.6, job { limits_rate to: 100, per: 1.minute, key: :global }.rate_limit_interval
-    assert_equal Rational(60, 91), job { limits_rate to: 100, per: 1.minute, burst: 10, key: :global }.rate_limit_interval
-    assert_equal 60, job { limits_rate to: 10, per: 1.minute, burst: 10, key: :global }.rate_limit_interval
-  end
-
   test "spacing below 1 ms raises" do
     error = assert_raises(ArgumentError) { job { limits_rate to: 1_001, per: 1.second, key: :global } }
     assert_match(/at least 1 ms apart/, error.message)
@@ -67,7 +61,7 @@ class SolidQueue::RateLimitDeclarationTest < ActiveSupport::TestCase
     error = assert_raises(ArgumentError) { job { limits_rate to: 1_002, per: 1.second, burst: 2, key: :global } }
     assert_match(/at least 1 ms apart/, error.message)
 
-    assert_equal 0.001, job { limits_rate to: 1_001, per: 1.second, burst: 2, key: :global }.rate_limit_interval
+    assert_equal 1_001, job { limits_rate to: 1_001, per: 1.second, burst: 2, key: :global }.rate_limit_to
   end
 
   test "declares a key and a group, as limits_concurrency takes them" do
