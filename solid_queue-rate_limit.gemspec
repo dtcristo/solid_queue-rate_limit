@@ -16,7 +16,7 @@ Gem::Specification.new do |spec|
   spec.metadata["changelog_uri"] = "https://github.com/dtcristo/solid_queue-rate_limit/blob/main/CHANGELOG.md"
 
   spec.files = Dir.chdir(File.expand_path(__dir__)) do
-    Dir["{app,lib}/**/*", "MIT-LICENSE", "README.md", "CHANGELOG.md"]
+    Dir["{app,lib}/**/*", "MIT-LICENSE", "README.md", "CHANGELOG.md", "UPGRADING.md"]
   end
 
   spec.required_ruby_version = ">= 3.2"
